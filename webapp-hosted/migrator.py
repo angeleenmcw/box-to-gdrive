@@ -61,8 +61,7 @@ def get_gdrive_service(creds_path="google_credentials.json", token_path="token.j
         else:
             if not os.path.exists(creds_path):
                 raise RuntimeError(f"Google credentials not found at {creds_path}.")
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, GDRIVE_SCOPES)
-            creds = flow.run_local_server(port=0)
+            raise RuntimeError('Interactive Google sign-in is not available in the hosted app; use the OAuth flow.')
         with open(token_path, "w") as f:
             f.write(creds.to_json())
     return build("drive", "v3", credentials=creds)
