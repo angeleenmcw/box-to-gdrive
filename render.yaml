@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: box-to-gdrive
+    runtime: python
+    rootDir: webapp-hosted
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 8 --timeout 120
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true          # Render generates a secure random value
+      - key: BOX_CLIENT_ID
+        sync: false                  # you enter these in the dashboard
+      - key: BOX_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: OAUTH_REDIRECT_BASE
+        sync: false                  # set to your Render URL after first deploy
