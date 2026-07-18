@@ -214,12 +214,15 @@ def _is_retryable(error):
     return False
 
 
-def with_backoff(func, *args, max_retries=7, base=1.0, **kwargs):
+def with_backoff(func, *args, max_retries=7, base=1.0, limiter=None, **kwargs):
     """Call an API function, retrying retryable errors with exponential backoff
-    plus jitter. Raises the last error if retries are exhausted."""
+    plus jitter. Raises the last error if retries are exhausted. If a
+    RateLimiter is supplied, a token is acquired before each attempt."""
     import random
     attempt = 0
     while True:
+        if limiter is not None:
+            limiter.acquire()
         try:
             return func(*args, **kwargs)
         except HttpError as e:
@@ -230,7 +233,36 @@ def with_backoff(func, *args, max_retries=7, base=1.0, **kwargs):
             attempt += 1
 
 
-def find_or_create_folder(drive, name, parent_id, shared_drive_id, dry_run=False):
+class RateLimiter:
+    """Thread-safe token bucket capping the combined rate of Drive API calls
+    across all workers. Google Drive allows ~200 write requests/sec per user;
+    set `rate` below that. `burst` permits a short spike; tokens refill at
+    `rate` per second. Raising --workers past this ceiling just makes extra
+    workers wait for tokens rather than exceeding the quota."""
+
+    def __init__(self, rate, burst=None):
+        self.rate = float(rate)
+        self.capacity = float(burst if burst is not None else rate)
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, tokens=1):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity,
+                                  self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                wait = (tokens - self.tokens) / self.rate
+            time.sleep(wait)
+
+
+def find_or_create_folder(drive, name, parent_id, shared_drive_id, dry_run=False,
+                          limiter=None):
     safe_name = name.replace("'", "\\'")
     query = (
         f"name = '{safe_name}' and mimeType = '{GOOGLE_FOLDER_MIME}' "
@@ -244,7 +276,8 @@ def find_or_create_folder(drive, name, parent_id, shared_drive_id, dry_run=False
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
             fields="files(id, name)",
-        ).execute
+        ).execute,
+        limiter=limiter,
     )
     files = resp.get("files", [])
     if files:
@@ -255,12 +288,13 @@ def find_or_create_folder(drive, name, parent_id, shared_drive_id, dry_run=False
     folder = with_backoff(
         drive.files().create(
             body=metadata, supportsAllDrives=True, fields="id"
-        ).execute
+        ).execute,
+        limiter=limiter,
     )
     return folder["id"]
 
 
-def upload_stream(drive, stream, name, parent_id):
+def upload_stream(drive, stream, name, parent_id, limiter=None):
     media = MediaIoBaseUpload(stream, mimetype="application/octet-stream", resumable=True)
     metadata = {"name": name, "parents": [parent_id]}
     request = drive.files().create(
@@ -271,6 +305,8 @@ def upload_stream(drive, stream, name, parent_id):
     attempt = 0
     max_retries = 7
     while response is None:
+        if limiter is not None:
+            limiter.acquire()
         try:
             _, response = request.next_chunk()
             attempt = 0  # reset after any successful chunk
@@ -287,7 +323,7 @@ def upload_stream(drive, stream, name, parent_id):
 # Migration
 # --------------------------------------------------------------------------- #
 def collect_files(box, box_folder_id, gdrive_parent_id, shared_drive_id,
-                  drive, ckpt, rel_path, dry_run, tasks):
+                  drive, ckpt, rel_path, dry_run, tasks, limiter=None):
     """Recursively create the folder tree (single-threaded, so folder IDs are
     stable) and gather the flat list of file transfer tasks."""
     items = box.folder(box_folder_id).get_items(
@@ -301,13 +337,14 @@ def collect_files(box, box_folder_id, gdrive_parent_id, shared_drive_id,
                 new_parent = cached
             else:
                 new_parent = find_or_create_folder(
-                    drive, item.name, gdrive_parent_id, shared_drive_id, dry_run
+                    drive, item.name, gdrive_parent_id, shared_drive_id, dry_run,
+                    limiter=limiter
                 )
                 if not dry_run:
                     ckpt.set_folder(item.id, new_parent)
             print(f"[folder] {item_path}")
             collect_files(box, item.id, new_parent, shared_drive_id,
-                          drive, ckpt, item_path, dry_run, tasks)
+                          drive, ckpt, item_path, dry_run, tasks, limiter)
         elif item.type == "file":
             tasks.append({
                 "box_file_id": item.id,
@@ -318,7 +355,7 @@ def collect_files(box, box_folder_id, gdrive_parent_id, shared_drive_id,
             })
 
 
-def transfer_one(box, token_path, task, ckpt, log):
+def transfer_one(box, token_path, task, ckpt, log, limiter=None):
     """Runs in a worker thread: download from Box, upload to Drive."""
     box_id = task["box_file_id"]
     try:
@@ -326,7 +363,8 @@ def transfer_one(box, token_path, task, ckpt, log):
         buffer = io.BytesIO()
         box.file(box_id).download_to(buffer)
         buffer.seek(0)
-        gdrive_id = upload_stream(drive, buffer, task["name"], task["parent_id"])
+        gdrive_id = upload_stream(drive, buffer, task["name"], task["parent_id"],
+                                  limiter=limiter)
         ckpt.mark_done(box_id)
         log.record("ok", box_id, task["path"], task["size"], gdrive_id)
         return (True, task["path"], None)
@@ -350,6 +388,10 @@ def main():
     parser.add_argument("--google-creds", default="google_credentials.json")
     parser.add_argument("--workers", type=int, default=4,
                         help="Parallel upload workers (default 4).")
+    parser.add_argument("--rate", type=float, default=10.0,
+                        help="Max combined Drive requests/sec across all workers "
+                             "(token bucket; default 10). Lets you raise --workers "
+                             "safely. Google's per-user write quota is ~200/sec.")
     parser.add_argument("--checkpoint", default="checkpoint.json")
     parser.add_argument("--log", default="transfer_log.csv")
     parser.add_argument("--reset", action="store_true",
@@ -368,14 +410,16 @@ def main():
     log = TransferLog(args.log)
 
     dest = args.dest_folder_id or args.shared_drive_id
+    limiter = RateLimiter(rate=args.rate, burst=max(args.rate, args.workers))
     print(f"Scanning Box folder {args.box_folder} -> Shared Drive {args.shared_drive_id}")
+    print(f"Workers: {args.workers} | Rate cap: {args.rate}/sec")
     if args.dry_run:
         print("*** DRY RUN — nothing will be transferred ***")
 
     # Phase 1: build folder tree + flat task list (single-threaded).
     tasks = []
     collect_files(box, args.box_folder, dest, args.shared_drive_id,
-                  drive, ckpt, "", args.dry_run, tasks)
+                  drive, ckpt, "", args.dry_run, tasks, limiter)
 
     pending = [t for t in tasks if not ckpt.is_done(t["box_file_id"])]
     skipped = len(tasks) - len(pending)
@@ -392,7 +436,7 @@ def main():
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(transfer_one, box, "token.json", t, ckpt, log): t
+            pool.submit(transfer_one, box, "token.json", t, ckpt, log, limiter): t
             for t in pending
         }
         for i, fut in enumerate(as_completed(futures), 1):
