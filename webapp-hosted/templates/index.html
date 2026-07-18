@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Box → Shared Drive Migration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #16211c;
+    --paper: #f6f4ee;
+    --panel: #fffdf8;
+    --line: #d9d4c6;
+    --muted: #6b6f68;
+    --accent: #2f6f4e;        /* forest green — "go / migrate" */
+    --accent-soft: #e4efe6;
+    --box-blue: #0061d5;      /* Box brand cue, used sparingly */
+    --warn: #b4472b;
+    --ok: #2f6f4e;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(22,33,28,.06), 0 4px 16px rgba(22,33,28,.05);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    padding: 22px 28px 18px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  header h1 {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 20px;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+  header .flow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: .04em;
+  }
+  header .flow b { color: var(--box-blue); font-weight: 500; }
+  header .flow i { color: var(--accent); font-style: normal; font-weight: 500; }
+
+  main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--line);
+    min-height: calc(100vh - 61px);
+  }
+  .panel { background: var(--panel); padding: 22px 24px; overflow: auto; }
+  .panel h2 {
+    font-family: "Space Grotesk", sans-serif;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+
+  /* Tree */
+  .tree { font-size: 14px; }
+  .node { user-select: none; }
+  .row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 6px; border-radius: 6px; cursor: default;
+  }
+  .row:hover { background: var(--accent-soft); }
+  .twist {
+    width: 16px; text-align: center; cursor: pointer; color: var(--muted);
+    font-family: "IBM Plex Mono", monospace; flex: none;
+  }
+  .twist.leaf { visibility: hidden; }
+  .row input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); flex: none; }
+  .row .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .kind { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); flex: none; }
+  .row.folder .name { font-weight: 500; }
+  .children { margin-left: 20px; border-left: 1px dotted var(--line); padding-left: 4px; }
+  .loading { color: var(--muted); font-size: 13px; padding: 4px 6px; font-style: italic; }
+
+  /* Destination + controls */
+  label.field { display: block; font-size: 13px; font-weight: 500; margin: 14px 0 6px; }
+  select, .btn {
+    font-family: inherit; font-size: 14px;
+  }
+  select {
+    width: 100%; padding: 9px 10px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--ink);
+  }
+  .row-inline { display: flex; gap: 12px; align-items: end; }
+  .row-inline > div { flex: 1; }
+  .workers { max-width: 110px; }
+
+  .selection-summary {
+    margin: 16px 0; padding: 12px 14px; border: 1px dashed var(--line);
+    border-radius: 8px; font-size: 13px; color: var(--muted);
+    background: var(--paper);
+  }
+  .selection-summary b { color: var(--ink); font-weight: 600; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--accent); color: #fff; border: none;
+    padding: 11px 20px; border-radius: 9px; font-weight: 600;
+    cursor: pointer; transition: filter .15s;
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* Progress */
+  .progress-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-top: 22px; font-size: 13px;
+  }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0 14px; }
+  .bar > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+  .counts { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--muted); }
+  .counts .ok { color: var(--ok); }
+  .counts .fail { color: var(--warn); }
+
+  .feed {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    line-height: 1.6; max-height: 320px; overflow: auto;
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    background: var(--paper);
+  }
+  .feed .line { display: flex; gap: 8px; }
+  .feed .tag { flex: none; }
+  .feed .tag.ok { color: var(--ok); }
+  .feed .tag.fail { color: var(--warn); }
+  .feed .tag.scan { color: var(--muted); }
+  .feed .path { color: var(--ink); word-break: break-all; }
+  .feed .err { color: var(--warn); }
+  .empty { color: var(--muted); font-style: italic; }
+  .banner {
+    padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-top: 14px;
+    display: none;
+  }
+  .banner.show { display: block; }
+  .banner.done { background: var(--accent-soft); color: var(--accent); }
+  .banner.error { background: #f6e3dd; color: var(--warn); }
+
+  /* Credentials / connection status */
+  .status-bar {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+    padding: 12px 28px; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; font-weight: 500; padding: 5px 12px;
+    border-radius: 99px; border: 1px solid var(--line);
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .chip.ok { border-color: #bcd8c4; background: var(--accent-soft); color: var(--accent); }
+  .chip.ok .dot { background: var(--accent); }
+  .chip.bad { border-color: #e4c3b8; background: #f8ece7; color: var(--warn); }
+  .chip.bad .dot { background: var(--warn); }
+  .chip .detail { color: var(--muted); font-weight: 400; }
+  .status-bar .spacer { flex: 1; }
+  .link-btn {
+    font-size: 13px; font-weight: 600; color: var(--accent);
+    background: none; border: none; cursor: pointer; padding: 5px 8px;
+  }
+  .link-btn:hover { text-decoration: underline; }
+
+  /* Credential drawer */
+  .drawer {
+    display: none; padding: 18px 28px; border-bottom: 1px solid var(--line);
+    background: var(--paper);
+  }
+  .drawer.open { display: block; }
+  .drawer h3 {
+    font-family: "Space Grotesk", sans-serif; font-size: 13px;
+    text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
+    margin: 0 0 4px;
+  }
+  .drawer p { font-size: 13px; color: var(--muted); margin: 4px 0 12px; max-width: 640px; }
+  .drop {
+    border: 1.5px dashed var(--line); border-radius: 10px; padding: 22px;
+    text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+    max-width: 640px;
+  }
+  .drop:hover, .drop.drag { border-color: var(--accent); background: var(--accent-soft); }
+  .drop .big { font-size: 14px; font-weight: 500; color: var(--ink); }
+  .drop .small { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .drop input { display: none; }
+  .cred-msg { font-size: 13px; margin-top: 10px; max-width: 640px; }
+  .cred-msg.ok { color: var(--accent); }
+  .cred-msg.bad { color: var(--warn); }
+  .steps { font-size: 12.5px; color: var(--muted); max-width: 640px; line-height: 1.7; margin-top: 12px; }
+  .steps code { font-family: "IBM Plex Mono", monospace; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+
+  /* OAuth connect cards */
+  .connect-row { display: flex; gap: 16px; flex-wrap: wrap; max-width: 680px; }
+  .connect-card {
+    flex: 1; min-width: 240px; border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px; background: var(--panel);
+  }
+  .cc-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .cc-name { font-family: "Space Grotesk", sans-serif; font-weight: 700; font-size: 16px; }
+  .cc-state { font-size: 12px; color: var(--muted); font-family: "IBM Plex Mono", monospace; }
+  .cc-state.on { color: var(--accent); }
+  .cc-desc { font-size: 13px; color: var(--muted); margin: 6px 0 12px; }
+  .btn.small { padding: 8px 16px; font-size: 14px; text-decoration: none; }
+  .link-btn.danger { color: var(--warn); display: inline-block; margin-left: 10px; }
+
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Box → Shared Drive Migration</h1>
+  <span class="flow">Copy from <b>Box</b> into a <i>Google Shared Drive</i></span>
+</header>
+
+<div class="status-bar">
+  <span class="chip" id="chip-box"><span class="dot"></span>Box<span class="detail">checking…</span></span>
+  <span class="chip" id="chip-google"><span class="dot"></span>Google Drive<span class="detail">checking…</span></span>
+  <span class="spacer"></span>
+  <button class="link-btn" id="toggle-creds">Manage connections</button>
+</div>
+
+<div class="drawer" id="drawer">
+  <h3>Connect your accounts</h3>
+  <p>Sign in to each service in its own window. This app never sees your
+     password or private keys — it receives only a temporary access token that
+     you can disconnect at any time.</p>
+  <div class="connect-row">
+    <div class="connect-card" id="card-box">
+      <div class="cc-head"><span class="cc-name" style="color:var(--box-blue)">Box</span>
+        <span class="cc-state" id="state-box">Not connected</span></div>
+      <p class="cc-desc">Authorize access to your Box files.</p>
+      <a class="btn small" id="btn-box" href="/oauth/box/start">Connect Box</a>
+      <button class="link-btn danger" id="dc-box" style="display:none">Disconnect</button>
+    </div>
+    <div class="connect-card" id="card-google">
+      <div class="cc-head"><span class="cc-name" style="color:var(--accent)">Google Drive</span>
+        <span class="cc-state" id="state-google">Not connected</span></div>
+      <p class="cc-desc">Authorize access to your Shared Drives.</p>
+      <a class="btn small" id="btn-google" href="/oauth/google/start">Connect Google</a>
+      <button class="link-btn danger" id="dc-google" style="display:none">Disconnect</button>
+    </div>
+  </div>
+  <div class="steps" id="server-warn" style="display:none">
+    <b>Server not fully configured.</b> The operator must set the Box and Google
+    app credentials as environment variables before connections will work.
+  </div>
+</div>
+
+<main>
+  <!-- LEFT: Box source tree -->
+  <section class="panel">
+    <h2>Choose what to copy from Box</h2>
+    <div id="tree" class="tree">
+      <div class="loading">Loading Box root…</div>
+    </div>
+  </section>
+
+  <!-- RIGHT: Destination, controls, progress -->
+  <section class="panel">
+    <h2>Destination</h2>
+    <label class="field" for="drive">Shared Drive</label>
+    <select id="drive"><option>Loading Shared Drives…</option></select>
+
+    <div class="row-inline">
+      <div>
+        <label class="field" for="dest">Destination folder ID <span style="color:var(--muted)">(optional)</span></label>
+        <select id="dest" disabled><option value="">Drive root</option></select>
+      </div>
+      <div class="workers">
+        <label class="field" for="workers">Workers</label>
+        <select id="workers">
+          <option>2</option><option selected>4</option><option>8</option>
+          <option>12</option><option>16</option><option>24</option>
+        </select>
+      </div>
+      <div class="workers">
+        <label class="field" for="rate">Req/sec</label>
+        <select id="rate">
+          <option>5</option><option selected>10</option><option>20</option>
+          <option>40</option><option>80</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="selection-summary" id="summary">
+      Nothing selected yet. Tick folders or files on the left.
+    </div>
+
+    <button class="btn" id="go" disabled>Migrate selected</button>
+
+    <div class="progress-head">
+      <span>Progress</span>
+      <span class="counts" id="counts"></span>
+    </div>
+    <div class="bar"><span id="barfill"></span></div>
+    <div class="feed" id="feed"><span class="empty">Transfer activity will appear here.</span></div>
+
+    <div class="banner" id="banner"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
