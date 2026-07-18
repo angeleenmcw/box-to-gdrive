@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+
+# secrets — never commit these
+box_config.json
+google_credentials.json
+token.json
+
+# runtime artifacts
+checkpoint.json
+transfer_log.csv
