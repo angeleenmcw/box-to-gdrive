@@ -261,6 +261,74 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// ---------- Credentials / status ----------
+const chipBox = document.getElementById("chip-box");
+const chipGoogle = document.getElementById("chip-google");
+const drawer = document.getElementById("drawer");
+const dropEl = document.getElementById("drop");
+const credFile = document.getElementById("cred-file");
+const credMsg = document.getElementById("cred-msg");
+document.getElementById("toggle-creds").addEventListener("click", () =>
+  drawer.classList.toggle("open"));
+
+function renderChip(el, label, state) {
+  el.className = "chip " + (state.ok ? "ok" : "bad");
+  el.innerHTML =
+    `<span class="dot"></span>${label}` +
+    `<span class="detail">${escapeHtml(state.message || "")}</span>`;
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch("/api/status");
+    const s = await r.json();
+    renderChip(chipBox, "Box", s.box);
+    renderChip(chipGoogle, "Google Drive", s.google);
+    // If Box isn't connected, open the drawer so the fix is obvious.
+    if (!s.box.ok) drawer.classList.add("open");
+    return s;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function uploadConfig(file) {
+  credMsg.className = "cred-msg";
+  credMsg.textContent = "Uploading and connecting…";
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/api/box/upload-config", { method: "POST", body: fd });
+    const data = await r.json();
+    if (data.ok) {
+      credMsg.className = "cred-msg ok";
+      credMsg.textContent = data.message + " Loading your Box files…";
+      await loadStatus();
+      await loadRoot();           // repopulate the tree now that Box works
+      setTimeout(() => drawer.classList.remove("open"), 1200);
+    } else {
+      credMsg.className = "cred-msg bad";
+      credMsg.textContent = data.error;
+    }
+  } catch (e) {
+    credMsg.className = "cred-msg bad";
+    credMsg.textContent = "Upload failed: " + e.message;
+  }
+}
+
+credFile.addEventListener("change", () => {
+  if (credFile.files[0]) uploadConfig(credFile.files[0]);
+});
+["dragenter", "dragover"].forEach((ev) =>
+  dropEl.addEventListener(ev, (e) => { e.preventDefault(); dropEl.classList.add("drag"); }));
+["dragleave", "drop"].forEach((ev) =>
+  dropEl.addEventListener(ev, (e) => { e.preventDefault(); dropEl.classList.remove("drag"); }));
+dropEl.addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) uploadConfig(f);
+});
+
 // ---------- boot ----------
+loadStatus();
 loadRoot();
 loadDrives();

@@ -49,9 +49,95 @@ def drive_client():
         return _drive
 
 
+def _validate_box_config(data):
+    """Check that an uploaded Box JWT config has the required key material.
+    Returns (ok, message)."""
+    try:
+        cfg = json.loads(data)
+    except (ValueError, TypeError):
+        return False, "File is not valid JSON."
+    settings = cfg.get("boxAppSettings")
+    if not isinstance(settings, dict):
+        return False, "Missing 'boxAppSettings'. This doesn't look like a Box JWT config."
+    if not settings.get("clientID") or not settings.get("clientSecret"):
+        return False, "Missing clientID / clientSecret in boxAppSettings."
+    app_auth = settings.get("appAuth") or {}
+    if not app_auth.get("privateKey"):
+        return False, ("Missing the private key (boxAppSettings.appAuth.privateKey). "
+                       "When creating the app, click 'Generate a Public/Private Keypair' "
+                       "and download that config — it embeds the key.")
+    if not app_auth.get("publicKeyID"):
+        return False, "Missing publicKeyID in appAuth."
+    if not cfg.get("enterpriseID"):
+        return False, "Missing enterpriseID. Use the config downloaded from the app's Configuration tab."
+    return True, "Config looks complete."
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/status")
+def api_status():
+    """Report which services are connected, so the UI can show/hide the
+    credential panel."""
+    box_ok, box_msg = False, ""
+    google_ok, google_msg = False, ""
+
+    # Box: file present + valid + client initialises.
+    if os.path.exists(BOX_CONFIG):
+        with open(BOX_CONFIG) as f:
+            ok, msg = _validate_box_config(f.read())
+        if not ok:
+            box_msg = msg
+        else:
+            try:
+                box_client()
+                box_ok = True
+                box_msg = "Connected"
+            except Exception as e:  # noqa: BLE001
+                box_msg = str(e)
+    else:
+        box_msg = "No box_config.json uploaded yet."
+
+    # Google: token cached or credentials present.
+    if os.path.exists(TOKEN_PATH):
+        google_ok, google_msg = True, "Connected"
+    elif os.path.exists(GOOGLE_CREDS):
+        google_msg = "Credentials present — sign-in needed."
+    else:
+        google_msg = "No google_credentials.json present."
+
+    return jsonify({"box": {"ok": box_ok, "message": box_msg},
+                    "google": {"ok": google_ok, "message": google_msg}})
+
+
+@app.route("/api/box/upload-config", methods=["POST"])
+def api_box_upload_config():
+    """Accept a Box JWT config file from the UI, validate it, save it, and
+    reset the cached client so the next call uses the new credentials."""
+    global _box
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "No file received."}), 400
+    raw = request.files["file"].read().decode("utf-8", errors="replace")
+    ok, msg = _validate_box_config(raw)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 400
+    # Save and reset the client.
+    with open(BOX_CONFIG, "w") as f:
+        f.write(raw)
+    with _lock:
+        _box = None
+    # Try to actually connect and read the root, to surface auth/authorization errors.
+    try:
+        migrator.list_box_folder(box_client(), "0")
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error":
+                        f"Config saved, but connecting to Box failed: {e}. "
+                        "If this mentions authorization, an admin must approve the "
+                        "app in the Box Admin Console (Apps > Custom Apps Manager)."}), 400
+    return jsonify({"ok": True, "message": "Box connected."})
 
 
 @app.route("/api/box/folder")
