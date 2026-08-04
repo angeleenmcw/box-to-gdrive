@@ -228,6 +228,9 @@ function handleEvent(evt) {
       barFill.style.width = "100%";
       showBanner("done",
         `Finished. ${evt.ok} copied, ${evt.fail} failed, ${evt.skipped} skipped.`);
+      // Offer the mapping log (Box URL → Drive URL for every file).
+      bannerEl.innerHTML +=
+        ' <a href="/api/log" style="color:var(--accent);font-weight:600;">Download migration log (CSV)</a>';
       goEl.disabled = false;
       break;
     case "fatal":

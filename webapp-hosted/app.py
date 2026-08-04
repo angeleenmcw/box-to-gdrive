@@ -41,7 +41,7 @@ import urllib.parse
 
 import requests
 from flask import (Flask, Response, jsonify, redirect, render_template,
-                   request, session, url_for)
+                   request, send_file, session, url_for)
 
 import migrator
 
@@ -114,6 +114,19 @@ def drive_creds_for_session():
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/log")
+def api_log():
+    """Download this session's transfer log (CSV with Box→Drive URL mapping)."""
+    sid = session.get("sid")
+    if not sid:
+        return "No migration has been run in this session yet.", 404
+    log_path = f"/tmp/log_{sid}.csv"
+    if not os.path.exists(log_path):
+        return "No log available yet — run a migration first.", 404
+    return send_file(log_path, mimetype="text/csv", as_attachment=True,
+                     download_name="box_to_drive_migration_log.csv")
 
 
 @app.route("/api/status")

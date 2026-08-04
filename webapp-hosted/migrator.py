@@ -323,14 +323,18 @@ class TransferLog:
         self.fh = open(path, "a", newline="")
         self.writer = csv.writer(self.fh)
         if new:
-            self.writer.writerow(["timestamp", "status", "box_file_id", "path",
-                                  "size_bytes", "gdrive_file_id", "error"])
+            self.writer.writerow(["timestamp", "status", "path",
+                                  "box_file_id", "box_url",
+                                  "gdrive_file_id", "gdrive_url",
+                                  "size_bytes", "error"])
             self.fh.flush()
 
     def record(self, status, fid, path, size="", gid="", error=""):
+        box_url = f"https://app.box.com/file/{fid}" if fid else ""
+        gdrive_url = f"https://drive.google.com/file/d/{gid}/view" if gid else ""
         with self.lock:
             self.writer.writerow([datetime.now(timezone.utc).isoformat(), status,
-                                  fid, path, size, gid, error])
+                                  path, fid, box_url, gid, gdrive_url, size, error])
             self.fh.flush()
 
     def close(self):
