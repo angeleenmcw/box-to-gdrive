@@ -259,6 +259,12 @@ _CONVERT_MAP = {
               "application/vnd.google-apps.presentation"),
     ".ppt":  ("application/vnd.ms-powerpoint",
               "application/vnd.google-apps.presentation"),
+    # Box stores some Google Slides as .gslide/.gslides but serves real
+    # PowerPoint bytes on download, so treat them as .pptx for conversion.
+    ".gslides": ("application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                 "application/vnd.google-apps.presentation"),
+    ".gslide":  ("application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                 "application/vnd.google-apps.presentation"),
     # ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     #           "application/vnd.google-apps.document"),
     # ".xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
