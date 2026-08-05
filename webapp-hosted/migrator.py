@@ -250,9 +250,45 @@ def find_or_create_folder(drive, name, parent_id, shared_drive_id, limiter=None)
     return folder["id"]
 
 
-def upload_stream(drive, stream, name, parent_id, limiter=None):
-    media = MediaIoBaseUpload(stream, mimetype="application/octet-stream", resumable=True)
-    metadata = {"name": name, "parents": [parent_id]}
+# Office extension -> (source mimetype, target Google mimetype).
+# When an entry matches, Drive converts the file to the native Google format
+# on upload. Only presentations are enabled by default (per requirements);
+# the docx/xlsx rows are here and commented so they're easy to turn on later.
+_CONVERT_MAP = {
+    ".pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation",
+              "application/vnd.google-apps.presentation"),
+    ".ppt":  ("application/vnd.ms-powerpoint",
+              "application/vnd.google-apps.presentation"),
+    # ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    #           "application/vnd.google-apps.document"),
+    # ".xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    #           "application/vnd.google-apps.spreadsheet"),
+}
+
+
+def _conversion_for(name):
+    """Return (source_mime, google_mime) if this filename should be converted
+    to a native Google format on upload, else None."""
+    lower = name.lower()
+    for ext, pair in _CONVERT_MAP.items():
+        if lower.endswith(ext):
+            return pair
+    return None
+
+
+def upload_stream(drive, stream, name, parent_id, limiter=None, convert=True):
+    conv = _conversion_for(name) if convert else None
+    if conv:
+        source_mime, google_mime = conv
+        media = MediaIoBaseUpload(stream, mimetype=source_mime, resumable=True)
+        # Drop the extension from the name so the Google file isn't "deck.pptx".
+        display_name = name.rsplit(".", 1)[0]
+        metadata = {"name": display_name, "parents": [parent_id],
+                    "mimeType": google_mime}
+    else:
+        media = MediaIoBaseUpload(stream, mimetype="application/octet-stream",
+                                  resumable=True)
+        metadata = {"name": name, "parents": [parent_id]}
     request = drive.files().create(
         body=metadata, media_body=media, supportsAllDrives=True, fields="id"
     )
@@ -269,7 +305,7 @@ def upload_stream(drive, stream, name, parent_id, limiter=None):
                 raise
             time.sleep(2 ** attempt + random.uniform(0, 1))
             attempt += 1
-    return response["id"]
+    return response["id"], bool(conv)
 
 
 # --------------------------------------------------------------------------- #
@@ -329,9 +365,16 @@ class TransferLog:
                                   "size_bytes", "error"])
             self.fh.flush()
 
-    def record(self, status, fid, path, size="", gid="", error=""):
+    def record(self, status, fid, path, size="", gid="", error="",
+               converted_slides=False):
         box_url = f"https://app.box.com/file/{fid}" if fid else ""
-        gdrive_url = f"https://drive.google.com/file/d/{gid}/view" if gid else ""
+        if gid:
+            if converted_slides:
+                gdrive_url = f"https://docs.google.com/presentation/d/{gid}/edit"
+            else:
+                gdrive_url = f"https://drive.google.com/file/d/{gid}/view"
+        else:
+            gdrive_url = ""
         with self.lock:
             self.writer.writerow([datetime.now(timezone.utc).isoformat(), status,
                                   path, fid, box_url, gid, gdrive_url, size, error])
@@ -415,10 +458,11 @@ def transfer_one(box, token_path, task, ckpt, log, limiter=None,
         buf = io.BytesIO()
         box_c.file(fid).download_to(buf)
         buf.seek(0)
-        gid = upload_stream(drive, buf, task["name"], task["parent_id"],
-                            limiter=limiter)
+        gid, converted = upload_stream(drive, buf, task["name"], task["parent_id"],
+                                       limiter=limiter)
         ckpt.mark_done(fid)
-        log.record("ok", fid, task["path"], task["size"], gid)
+        log.record("ok", fid, task["path"], task["size"], gid,
+                   converted_slides=converted)
         return (True, task["path"], None)
     except Exception as e:  # noqa: BLE001
         log.record("error", fid, task["path"], task["size"], error=str(e))
