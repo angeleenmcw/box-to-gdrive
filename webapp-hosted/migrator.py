@@ -449,13 +449,19 @@ def expand_selection(box, selected_folders, selected_files, dest_parent_id,
 
 def _download_box_file(box_c, fid, buf):
     """Download a Box file's content into buf. Raises a descriptive error for
-    the common failure where a Box-native Google file has no downloadable
-    content (the API returns 404 on /content)."""
+    the common failures: an expired Box session (401), or a Box-native Google
+    file that has no downloadable content (404)."""
     try:
         box_c.file(fid).download_to(buf)
         return
     except Exception as e:  # noqa: BLE001
         msg = str(e)
+        if ("invalid_token" in msg or "401" in msg
+                or "expired" in msg.lower() or "invalid_grant" in msg):
+            raise RuntimeError(
+                "Box session expired mid-transfer. Disconnect and reconnect Box, "
+                "then re-run — already-copied files will be skipped."
+            ) from e
         # Box returns 404 on /content for Google-format files that have no
         # stored binary (Docs/Sheets/Slides created via Box's Google editor).
         if "404" in msg or "not_found" in msg.lower():

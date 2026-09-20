@@ -323,10 +323,28 @@ def api_migrate():
 
     job_id = _new_job()
 
+    # Shared, mutable token holder for this run. When the Box SDK refreshes the
+    # access token, every worker's on_refresh writes the new pair here, so all
+    # workers pick up the fresh token instead of each retrying with a stale one.
+    box_token_state = {
+        "access_token": box_tok["access_token"],
+        "refresh_token": box_tok.get("refresh_token"),
+    }
+    box_token_lock = threading.Lock()
+
+    def _on_box_refresh(access, refresh):
+        with box_token_lock:
+            box_token_state["access_token"] = access
+            if refresh:
+                box_token_state["refresh_token"] = refresh
+
     def box_factory():
+        with box_token_lock:
+            at = box_token_state["access_token"]
+            rt = box_token_state["refresh_token"]
         return migrator.box_client_from_token(
-            box_tok["access_token"], box_tok.get("refresh_token"),
-            client_id=BOX_CLIENT_ID, client_secret=BOX_CLIENT_SECRET)
+            at, rt, client_id=BOX_CLIENT_ID, client_secret=BOX_CLIENT_SECRET,
+            on_refresh=_on_box_refresh)
 
     def drive_factory():
         creds = migrator.gdrive_creds_from_token(
@@ -364,6 +382,21 @@ def api_migrate():
         try:
             box = box_factory()
             drive = drive_factory()
+            # Pre-flight: verify the Box token actually works before scanning,
+            # so an expired session fails fast with a clear message instead of
+            # 401-ing on every file.
+            try:
+                box.user(user_id="me").get(fields=["id"])
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if ("invalid_token" in msg or "invalid_grant" in msg
+                        or "expired" in msg.lower() or "401" in msg):
+                    _update_job(job_id, status="error",
+                                error="Box session expired. Please disconnect and "
+                                      "reconnect Box (top of the page), then run the "
+                                      "migration again.")
+                    return
+                raise
             ckpt = migrator.Checkpoint(ckpt_path)
             log = migrator.TransferLog(log_path)
             limiter = migrator.RateLimiter(rate=rate, burst=max(rate, workers))
