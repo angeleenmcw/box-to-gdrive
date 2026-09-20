@@ -265,12 +265,33 @@ def api_shared_drives():
 _jobs = {}          # job_id -> state dict
 _jobs_lock = threading.Lock()
 
+# Job state is also written to disk so a progress poll still works after the
+# server process restarts (Render recycles the instance). Without this, a
+# restart wipes the in-memory job and every poll 404s, which looks like a
+# frozen migration. On disk, the poll returns the last known state instead.
+def _job_path(job_id):
+    return f"/tmp/job_{job_id}.json"
+
+
+def _persist_job(job_id):
+    """Write the current in-memory job state to disk. Caller holds _jobs_lock."""
+    j = _jobs.get(job_id)
+    if j is None:
+        return
+    try:
+        tmp = _job_path(job_id) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(j, f)
+        os.replace(tmp, _job_path(job_id))
+    except OSError:
+        pass  # disk hiccup shouldn't crash the migration
+
 
 def _new_job():
     job_id = secrets.token_hex(8)
     with _jobs_lock:
         _jobs[job_id] = {
-            "status": "starting",          # starting|scanning|running|done|error
+            "status": "starting",          # starting|scanning|running|done|error|interrupted
             "total": 0, "pending": 0, "skipped": 0,
             "done": 0, "ok": 0, "fail": 0,
             "recent": [],                  # last handful of file events
@@ -278,6 +299,7 @@ def _new_job():
             "error": None,
             "cursor": 0,                   # monotonically increasing event count
         }
+        _persist_job(job_id)
     return job_id
 
 
@@ -286,6 +308,7 @@ def _update_job(job_id, **changes):
         j = _jobs.get(job_id)
         if j:
             j.update(changes)
+            _persist_job(job_id)
 
 
 def _push_recent(job_id, line):
@@ -296,6 +319,7 @@ def _push_recent(job_id, line):
             j["recent"].append(line)
             # keep only the last 40 lines to bound memory
             j["recent"] = j["recent"][-40:]
+            _persist_job(job_id)
 
 
 @app.route("/api/migrate", methods=["POST"])
@@ -372,6 +396,7 @@ def api_migrate():
                     if jj is not None:
                         jj.setdefault("failures", []).append(
                             {"path": evt.get("path", ""), "error": evt.get("error", "")})
+                        _persist_job(job_id)
         elif t == "done":
             _update_job(job_id, status="done", ok=evt["ok"],
                         fail=evt["fail"], skipped=evt["skipped"])
@@ -422,13 +447,29 @@ def api_migrate():
 def api_progress(job_id):
     with _jobs_lock:
         j = _jobs.get(job_id)
-        if not j:
-            return jsonify({"found": False, "error": "Unknown job"}), 404
-        # Return a copy so we don't hold the lock while serializing.
-        snapshot = dict(j)
-        snapshot["recent"] = list(j["recent"])
-        snapshot["failures"] = list(j.get("failures", []))
-    snapshot["found"] = True     # envelope success flag (distinct from ok-count)
+        if j:
+            snapshot = dict(j)
+            snapshot["recent"] = list(j["recent"])
+            snapshot["failures"] = list(j.get("failures", []))
+            snapshot["found"] = True
+            return jsonify(snapshot)
+
+    # Not in memory — the process may have restarted mid-run. Read the last
+    # state we persisted to disk so the UI can show a recoverable message
+    # instead of a 404 that spins forever.
+    try:
+        with open(_job_path(job_id)) as f:
+            snapshot = json.load(f)
+    except (OSError, ValueError):
+        return jsonify({"found": False, "error": "Unknown job"}), 404
+
+    # If it was still running when we lost it, the restart interrupted it.
+    if snapshot.get("status") in ("starting", "scanning", "running"):
+        snapshot["status"] = "interrupted"
+        snapshot["error"] = ("The server restarted mid-migration, so it was "
+                             "interrupted. Files already copied are saved — click "
+                             "Migrate again to resume where it left off.")
+    snapshot["found"] = True
     return jsonify(snapshot)
 
 
