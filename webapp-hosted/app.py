@@ -34,7 +34,6 @@ Run locally for testing:
 
 import json
 import os
-import queue
 import secrets
 import threading
 import urllib.parse
@@ -254,6 +253,51 @@ def api_shared_drives():
 # --------------------------------------------------------------------------- #
 # Migration (SSE) — builds per-thread clients from the session's tokens
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Background jobs
+#
+# Instead of doing all the work while holding one long HTTP connection open
+# (which hosts time out), we start the migration in a background thread and let
+# the browser poll a lightweight status endpoint. Each poll is a fast request,
+# so nothing ever hits a connection-duration limit, and the job runs to
+# completion server-side regardless of the browser.
+# --------------------------------------------------------------------------- #
+_jobs = {}          # job_id -> state dict
+_jobs_lock = threading.Lock()
+
+
+def _new_job():
+    job_id = secrets.token_hex(8)
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "status": "starting",          # starting|scanning|running|done|error
+            "total": 0, "pending": 0, "skipped": 0,
+            "done": 0, "ok": 0, "fail": 0,
+            "recent": [],                  # last handful of file events
+            "failures": [],                # {path, error} for every failed file
+            "error": None,
+            "cursor": 0,                   # monotonically increasing event count
+        }
+    return job_id
+
+
+def _update_job(job_id, **changes):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j:
+            j.update(changes)
+
+
+def _push_recent(job_id, line):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if j:
+            j["cursor"] += 1
+            j["recent"].append(line)
+            # keep only the last 40 lines to bound memory
+            j["recent"] = j["recent"][-40:]
+
+
 @app.route("/api/migrate", methods=["POST"])
 def api_migrate():
     if not _box_tokens() or not _google_tokens():
@@ -267,18 +311,17 @@ def api_migrate():
     workers = int(payload.get("workers", 4))
     rate = float(payload.get("rate", 10))
 
-    # Snapshot tokens now, in the request thread, so worker threads don't touch
-    # the session object.
     box_tok = dict(_box_tokens())
     google_tok = dict(_google_tokens())
 
-    # Per-session working files (isolate one user's run from another's).
     sid = session.get("sid")
     if not sid:
         sid = secrets.token_hex(8)
         session["sid"] = sid
     ckpt_path = f"/tmp/ckpt_{sid}.json"
     log_path = f"/tmp/log_{sid}.csv"
+
+    job_id = _new_job()
 
     def box_factory():
         return migrator.box_client_from_token(
@@ -290,10 +333,32 @@ def api_migrate():
             google_tok, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
         return migrator.gdrive_service_from_creds(creds)
 
-    events = queue.Queue()
-
     def progress(evt):
-        events.put(evt)
+        t = evt.get("type")
+        if t == "scanning":
+            _update_job(job_id, status="scanning")
+        elif t == "scan":
+            _push_recent(job_id, f"scan: {evt.get('path','')}")
+        elif t == "start":
+            _update_job(job_id, status="running", total=evt["total"],
+                        pending=evt["pending"], skipped=evt["skipped"])
+        elif t == "file":
+            _update_job(job_id, done=evt["done"], ok=evt["ok_count"],
+                        fail=evt["fail_count"])
+            tag = "ok" if evt["ok"] else "FAIL"
+            extra = "" if evt["ok"] else f"  ({evt.get('error','')})"
+            _push_recent(job_id, f"{tag}: {evt.get('path','')}{extra}")
+            if not evt["ok"]:
+                with _jobs_lock:
+                    jj = _jobs.get(job_id)
+                    if jj is not None:
+                        jj.setdefault("failures", []).append(
+                            {"path": evt.get("path", ""), "error": evt.get("error", "")})
+        elif t == "done":
+            _update_job(job_id, status="done", ok=evt["ok"],
+                        fail=evt["fail"], skipped=evt["skipped"])
+        elif t == "fatal":
+            _update_job(job_id, status="error", error=evt.get("error"))
 
     def worker():
         try:
@@ -312,20 +377,26 @@ def api_migrate():
                 box_factory=box_factory)
             log.close()
         except Exception as e:  # noqa: BLE001
-            progress({"type": "fatal", "error": str(e)})
-        finally:
-            events.put(None)
+            _update_job(job_id, status="error", error=str(e))
 
     threading.Thread(target=worker, daemon=True).start()
 
-    def stream():
-        while True:
-            evt = events.get()
-            if evt is None:
-                break
-            yield f"data: {json.dumps(evt)}\n\n"
+    # Return immediately; the browser polls /api/progress from here.
+    return jsonify({"ok": True, "job_id": job_id})
 
-    return Response(stream(), mimetype="text/event-stream")
+
+@app.route("/api/progress/<job_id>")
+def api_progress(job_id):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        if not j:
+            return jsonify({"found": False, "error": "Unknown job"}), 404
+        # Return a copy so we don't hold the lock while serializing.
+        snapshot = dict(j)
+        snapshot["recent"] = list(j["recent"])
+        snapshot["failures"] = list(j.get("failures", []))
+    snapshot["found"] = True     # envelope success flag (distinct from ok-count)
+    return jsonify(snapshot)
 
 
 if __name__ == "__main__":

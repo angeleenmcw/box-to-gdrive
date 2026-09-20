@@ -146,13 +146,19 @@ function updateGoState() {
 
 driveEl.addEventListener("change", updateGoState);
 
-// ---------- Migration (SSE) ----------
+// ---------- Migration (background job + polling) ----------
+let totalPending = 0;
+let lastRenderedCursor = 0;
+let pollTimer = null;
+
 goEl.addEventListener("click", async () => {
   goEl.disabled = true;
   feedEl.innerHTML = "";
   bannerEl.className = "banner";
   barFill.style.width = "0%";
   countsEl.textContent = "";
+  totalPending = 0;
+  lastRenderedCursor = 0;
 
   const body = {
     shared_drive_id: driveEl.value,
@@ -163,31 +169,94 @@ goEl.addEventListener("click", async () => {
     rate: parseFloat(rateEl.value),
   };
 
-  const resp = await fetch("/api/migrate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buffer.indexOf("\n\n")) !== -1) {
-      const chunk = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 2);
-      if (chunk.startsWith("data:")) handleEvent(JSON.parse(chunk.slice(5).trim()));
-    }
+  let start;
+  try {
+    const resp = await fetch("/api/migrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    start = await resp.json();
+  } catch (e) {
+    showBanner("error", "Could not start migration: " + e.message);
+    goEl.disabled = false;
+    return;
   }
+  if (!start.ok) {
+    showBanner("error", start.error || "Could not start migration.");
+    goEl.disabled = false;
+    return;
+  }
+
+  addLine("scan", "scan", "Migration started. Working…");
+  pollProgress(start.job_id);
 });
 
+function pollProgress(jobId) {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    let j;
+    try {
+      const r = await fetch("/api/progress/" + jobId);
+      j = await r.json();
+    } catch (e) {
+      return; // transient network blip; keep polling
+    }
+    if (!j.found) return;
+    renderProgress(j);
+    if (j.status === "done" || j.status === "error") {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }, 2000);
+}
+
+function renderProgress(j) {
+  // Update counts and bar.
+  if (j.pending) totalPending = j.pending;
+  if (j.status === "running" || j.status === "done") {
+    const pct = totalPending ? Math.round((j.done / totalPending) * 100) : 0;
+    barFill.style.width = pct + "%";
+    updateCounts(j.ok, j.fail, j.done);
+  }
+  // Append any new feed lines we haven't shown yet.
+  if (Array.isArray(j.recent) && j.cursor > lastRenderedCursor) {
+    const newCount = j.cursor - lastRenderedCursor;
+    const fresh = j.recent.slice(-newCount);
+    for (const line of fresh) {
+      if (line.startsWith("ok:")) addLine("ok", "ok", line.slice(3).trim());
+      else if (line.startsWith("FAIL:")) addLine("FAIL", "fail", line.slice(5).trim());
+      else addLine("scan", "scan", line.replace(/^scan:\s*/, ""));
+    }
+    lastRenderedCursor = j.cursor;
+  }
+  // Terminal states.
+  if (j.status === "done") {
+    barFill.style.width = "100%";
+    showBanner("done",
+      `Finished. ${j.ok} copied, ${j.fail} failed, ${j.skipped} skipped.`);
+    bannerEl.innerHTML +=
+      ' <a href="/api/log" style="color:var(--accent);font-weight:600;">Download migration log (CSV)</a>';
+    // If anything failed, list each failure with its reason so it's visible.
+    if (j.fail > 0 && Array.isArray(j.failures) && j.failures.length) {
+      const box = document.createElement("div");
+      box.className = "failures";
+      let html = `<div class="failures-head">${j.failures.length} file(s) could not be copied:</div>`;
+      for (const f of j.failures) {
+        html += `<div class="failrow"><span class="failpath">${escapeHtml(f.path)}</span>` +
+                `<span class="failwhy">${escapeHtml(f.error || "unknown error")}</span></div>`;
+      }
+      box.innerHTML = html;
+      feedEl.parentNode.insertBefore(box, feedEl.nextSibling);
+    }
+    goEl.disabled = false;
+  } else if (j.status === "error") {
+    showBanner("error", "Migration stopped: " + (j.error || "unknown error"));
+    goEl.disabled = false;
+  }
+}
+
 function addLine(tag, tagClass, text, errText) {
-  // Clear the placeholder on first real line.
   const placeholder = feedEl.querySelector(".empty");
   if (placeholder) placeholder.remove();
   const line = document.createElement("div");
@@ -200,48 +269,7 @@ function addLine(tag, tagClass, text, errText) {
   feedEl.scrollTop = feedEl.scrollHeight;
 }
 
-let totalPending = 0;
-
-function handleEvent(evt) {
-  switch (evt.type) {
-    case "scanning":
-      addLine("scan", "scan", "Scanning Box selection…");
-      break;
-    case "scan":
-      addLine("scan", "scan", evt.path);
-      break;
-    case "start":
-      totalPending = evt.pending;
-      addLine("info", "scan",
-        `${evt.total} files found · ${evt.skipped} already done · ${evt.pending} to copy`);
-      updateCounts(0, 0, 0);
-      break;
-    case "file": {
-      const tag = evt.ok ? "ok" : "FAIL";
-      addLine(tag, evt.ok ? "ok" : "fail", evt.path, evt.ok ? null : evt.error);
-      const pct = totalPending ? Math.round((evt.done / totalPending) * 100) : 100;
-      barFill.style.width = pct + "%";
-      updateCounts(evt.ok_count, evt.fail_count, evt.done);
-      break;
-    }
-    case "done":
-      barFill.style.width = "100%";
-      showBanner("done",
-        `Finished. ${evt.ok} copied, ${evt.fail} failed, ${evt.skipped} skipped.`);
-      // Offer the mapping log (Box URL → Drive URL for every file).
-      bannerEl.innerHTML +=
-        ' <a href="/api/log" style="color:var(--accent);font-weight:600;">Download migration log (CSV)</a>';
-      goEl.disabled = false;
-      break;
-    case "fatal":
-      showBanner("error", "Migration stopped: " + evt.error);
-      goEl.disabled = false;
-      break;
-  }
-}
-
-function updateCounts(ok, fail, done) {
-  countsEl.innerHTML =
+function updateCounts(ok, fail, done) {  countsEl.innerHTML =
     `<span class="ok">${ok} ok</span> · ` +
     `<span class="fail">${fail} failed</span> · ${done}/${totalPending}`;
 }

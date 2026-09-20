@@ -447,6 +447,27 @@ def expand_selection(box, selected_folders, selected_files, dest_parent_id,
     return tasks
 
 
+def _download_box_file(box_c, fid, buf):
+    """Download a Box file's content into buf. Raises a descriptive error for
+    the common failure where a Box-native Google file has no downloadable
+    content (the API returns 404 on /content)."""
+    try:
+        box_c.file(fid).download_to(buf)
+        return
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        # Box returns 404 on /content for Google-format files that have no
+        # stored binary (Docs/Sheets/Slides created via Box's Google editor).
+        if "404" in msg or "not_found" in msg.lower():
+            raise RuntimeError(
+                "File has no downloadable content in Box (likely a Google-format "
+                "file created in Box's Google editor, which the Box API cannot "
+                "export). Open it in Box and use 'Download as' to save an Office "
+                "copy, or recreate it directly in Google Drive."
+            ) from e
+        raise
+
+
 def transfer_one(box, token_path, task, ckpt, log, limiter=None,
                  drive_factory=None, box_factory=None):
     """Download a file from Box and upload it to Drive.
@@ -462,7 +483,7 @@ def transfer_one(box, token_path, task, ckpt, log, limiter=None,
         drive = drive_factory() if drive_factory else build_gdrive_service_from_token(token_path)
         box_c = box_factory() if box_factory else box
         buf = io.BytesIO()
-        box_c.file(fid).download_to(buf)
+        _download_box_file(box_c, fid, buf)
         buf.seek(0)
         gid, converted = upload_stream(drive, buf, task["name"], task["parent_id"],
                                        limiter=limiter)

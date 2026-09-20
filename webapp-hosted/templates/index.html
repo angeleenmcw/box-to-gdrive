@@ -152,6 +152,16 @@
   .banner.done { background: var(--accent-soft); color: var(--accent); }
   .banner.error { background: #f6e3dd; color: var(--warn); }
 
+  .failures {
+    margin-top: 14px; border: 1px solid #e4c3b8; border-radius: 8px;
+    background: #fbf1ec; padding: 12px 14px; font-size: 13px;
+  }
+  .failures-head { font-weight: 600; color: var(--warn); margin-bottom: 8px; }
+  .failrow { display: flex; flex-direction: column; padding: 6px 0; border-top: 1px solid #eeddd5; }
+  .failrow:first-of-type { border-top: none; }
+  .failpath { font-family: "IBM Plex Mono", monospace; color: var(--ink); word-break: break-all; }
+  .failwhy { color: var(--warn); margin-top: 2px; }
+
   /* Credentials / connection status */
   .status-bar {
     display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
