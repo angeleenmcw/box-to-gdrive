@@ -429,13 +429,9 @@ def _launch_migration(job_id, params, box_tok, google_tok, sid):
             log = migrator.TransferLog(log_path)
             limiter = migrator.RateLimiter(rate=rate, burst=max(rate, workers))
             progress({"type": "scanning"})
-            tasks = migrator.expand_selection(
-                box, folders, files, dest_parent, shared_drive_id,
-                drive, ckpt, progress, limiter=limiter)
-            migrator.run_migration(
-                box, None, tasks, ckpt, log, workers, progress,
-                limiter=limiter, drive_factory=drive_factory,
-                box_factory=box_factory)
+            migrator.stream_migration(
+                box_factory, drive_factory, folders, files, dest_parent,
+                shared_drive_id, ckpt, log, workers, progress, limiter=limiter)
             log.close()
         except Exception as e:  # noqa: BLE001
             msg = str(e)
