@@ -608,23 +608,50 @@ def run_migration(box, token_path, tasks, ckpt, log, workers, progress,
 def stream_migration(box_factory, drive_factory, selected_folders, selected_files,
                      dest_parent_id, shared_drive_id, ckpt, log, workers, progress,
                      limiter=None):
-    """Walk the Box tree and transfer files AS THEY ARE DISCOVERED, instead of
-    scanning the whole tree first. Memory stays flat regardless of tree size,
-    and files start moving within seconds. Progress totals grow as the walk
-    finds more files (no full count is known upfront).
+    """Walk the Box tree and transfer files AS THEY ARE DISCOVERED.
 
-    A bounded queue keeps the walker from racing far ahead of the workers, so
-    at most ~2x `workers` tasks are ever held in memory at once.
+    The walk does NOT create Google Drive folders — it only reads Box (one cheap
+    call per folder), so scanning a huge, deep tree stays fast and light. Each
+    file task carries the chain of (box_folder_id, name) from the selected root
+    down to its parent; the destination folder path is created lazily, once per
+    folder, the first time a file actually needs it. This keeps the scan from
+    stalling on thousands of synchronous Drive folder-creates.
     """
     import queue as _queue
 
-    scan_box = box_factory()            # dedicated client for the walk
-    drive_for_folders = drive_factory()  # for find_or_create_folder during walk
+    scan_box = box_factory()
 
-    task_q = _queue.Queue(maxsize=max(workers * 2, 8))
+    task_q = _queue.Queue(maxsize=max(workers * 4, 16))
     counters = {"found": 0, "done": 0, "ok": 0, "fail": 0, "skipped": 0}
     clock = threading.Lock()
-    DONE = object()                     # sentinel: no more tasks
+    DONE = object()
+
+    # Lazy destination-folder resolver, shared across workers. Maps a Box folder
+    # id to its created Google Drive folder id; creates the whole ancestor chain
+    # on demand, each folder at most once.
+    folder_lock = threading.Lock()
+
+    def resolve_dest(drive, chain):
+        """chain: list of (box_folder_id, name) from the selected root down to
+        the file's immediate parent. Returns the Drive folder id to upload into,
+        creating any missing folders along the way. dest_parent_id is the base."""
+        parent_gid = dest_parent_id
+        for box_fid, name in chain:
+            cached = ckpt.get_folder(box_fid)
+            if cached:
+                parent_gid = cached
+                continue
+            # Serialize creation so two workers don't double-create the same folder.
+            with folder_lock:
+                cached = ckpt.get_folder(box_fid)   # re-check inside the lock
+                if cached:
+                    parent_gid = cached
+                    continue
+                gid = find_or_create_folder(drive, name, parent_gid,
+                                            shared_drive_id, limiter=limiter)
+                ckpt.set_folder(box_fid, gid)
+                parent_gid = gid
+        return parent_gid
 
     def emit_counts(path=None, success=None, error=None):
         with clock:
@@ -634,58 +661,43 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
                        "ok_count": counters["ok"], "fail_count": counters["fail"]}
         progress(payload)
 
-    # --- producer: walk the tree, enqueue file tasks, create dest folders ---
+    # --- producer: walk Box only; attach the folder chain to each file task ---
     def walker():
-        def walk(box_folder_id, gdrive_parent_id, rel_path):
+        def walk(box_folder_id, chain, rel_path):
             for item in _iter_box_folder_basic(scan_box, box_folder_id):
                 item_path = f"{rel_path}/{item['name']}" if rel_path else item["name"]
                 if item["type"] == "folder":
-                    cached = ckpt.get_folder(item["id"])
-                    if cached:
-                        new_parent = cached
-                    else:
-                        new_parent = find_or_create_folder(
-                            drive_for_folders, item["name"], gdrive_parent_id,
-                            shared_drive_id, limiter=limiter)
-                        ckpt.set_folder(item["id"], new_parent)
+                    # Just recurse — no Drive call here.
                     progress({"type": "scan", "path": item_path})
-                    walk(item["id"], new_parent, item_path)
+                    walk(item["id"], chain + [(item["id"], item["name"])], item_path)
                 else:
                     task = {"box_file_id": item["id"], "name": item["name"],
                             "path": item_path, "size": item.get("size", ""),
-                            "parent_id": gdrive_parent_id}
+                            "chain": chain}
                     with clock:
                         counters["found"] += 1
-                    task_q.put(task)          # blocks if queue full (back-pressure)
+                    task_q.put(task)
 
         try:
             for fid in selected_folders:
                 info = scan_box.folder(fid).get(fields=["name"])
                 name = info.name
-                cached = ckpt.get_folder(fid)
-                if cached:
-                    top = cached
-                else:
-                    top = find_or_create_folder(drive_for_folders, name,
-                                                dest_parent_id, shared_drive_id,
-                                                limiter=limiter)
-                    ckpt.set_folder(fid, top)
                 progress({"type": "scan", "path": name})
-                walk(fid, top, name)
+                walk(fid, [(fid, name)], name)
             for f in selected_files:
                 task = {"box_file_id": f["id"], "name": f["name"],
                         "path": f["name"], "size": f.get("size", ""),
-                        "parent_id": dest_parent_id}
+                        "chain": []}   # empty chain = straight into dest root
                 with clock:
                     counters["found"] += 1
                 task_q.put(task)
         finally:
-            # Signal every worker to stop.
             for _ in range(workers):
                 task_q.put(DONE)
 
-    # --- consumers: pull tasks and transfer, each with its own clients ---
+    # --- consumers: resolve dest folder lazily, then transfer ---
     def consumer():
+        drive = drive_factory()
         while True:
             task = task_q.get()
             if task is DONE:
@@ -696,8 +708,15 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
                     counters["skipped"] += 1
                 task_q.task_done()
                 continue
-            success, path, err = transfer_one(
-                None, None, task, ckpt, log, limiter, drive_factory, box_factory)
+            try:
+                parent_id = resolve_dest(drive, task["chain"])
+                task["parent_id"] = parent_id
+                success, path, err = transfer_one(
+                    None, None, task, ckpt, log, limiter, drive_factory, box_factory)
+            except Exception as e:  # noqa: BLE001
+                success, path, err = False, task["path"], str(e)
+                log.record("error", task["box_file_id"], task["path"],
+                           task.get("size", ""), error=str(e))
             with clock:
                 counters["done"] += 1
                 if success:
