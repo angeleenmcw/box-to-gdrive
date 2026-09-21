@@ -603,3 +603,124 @@ def run_migration(box, token_path, tasks, ckpt, log, workers, progress,
 
     progress({"type": "done", "ok": ok, "fail": fail, "skipped": skipped})
     return ok, fail
+
+
+def stream_migration(box_factory, drive_factory, selected_folders, selected_files,
+                     dest_parent_id, shared_drive_id, ckpt, log, workers, progress,
+                     limiter=None):
+    """Walk the Box tree and transfer files AS THEY ARE DISCOVERED, instead of
+    scanning the whole tree first. Memory stays flat regardless of tree size,
+    and files start moving within seconds. Progress totals grow as the walk
+    finds more files (no full count is known upfront).
+
+    A bounded queue keeps the walker from racing far ahead of the workers, so
+    at most ~2x `workers` tasks are ever held in memory at once.
+    """
+    import queue as _queue
+
+    scan_box = box_factory()            # dedicated client for the walk
+    drive_for_folders = drive_factory()  # for find_or_create_folder during walk
+
+    task_q = _queue.Queue(maxsize=max(workers * 2, 8))
+    counters = {"found": 0, "done": 0, "ok": 0, "fail": 0, "skipped": 0}
+    clock = threading.Lock()
+    DONE = object()                     # sentinel: no more tasks
+
+    def emit_counts(path=None, success=None, error=None):
+        with clock:
+            payload = {"type": "file", "path": path, "ok": success,
+                       "error": error, "done": counters["done"],
+                       "pending": counters["found"],
+                       "ok_count": counters["ok"], "fail_count": counters["fail"]}
+        progress(payload)
+
+    # --- producer: walk the tree, enqueue file tasks, create dest folders ---
+    def walker():
+        def walk(box_folder_id, gdrive_parent_id, rel_path):
+            for item in _iter_box_folder_basic(scan_box, box_folder_id):
+                item_path = f"{rel_path}/{item['name']}" if rel_path else item["name"]
+                if item["type"] == "folder":
+                    cached = ckpt.get_folder(item["id"])
+                    if cached:
+                        new_parent = cached
+                    else:
+                        new_parent = find_or_create_folder(
+                            drive_for_folders, item["name"], gdrive_parent_id,
+                            shared_drive_id, limiter=limiter)
+                        ckpt.set_folder(item["id"], new_parent)
+                    progress({"type": "scan", "path": item_path})
+                    walk(item["id"], new_parent, item_path)
+                else:
+                    task = {"box_file_id": item["id"], "name": item["name"],
+                            "path": item_path, "size": item.get("size", ""),
+                            "parent_id": gdrive_parent_id}
+                    with clock:
+                        counters["found"] += 1
+                    task_q.put(task)          # blocks if queue full (back-pressure)
+
+        try:
+            for fid in selected_folders:
+                info = scan_box.folder(fid).get(fields=["name"])
+                name = info.name
+                cached = ckpt.get_folder(fid)
+                if cached:
+                    top = cached
+                else:
+                    top = find_or_create_folder(drive_for_folders, name,
+                                                dest_parent_id, shared_drive_id,
+                                                limiter=limiter)
+                    ckpt.set_folder(fid, top)
+                progress({"type": "scan", "path": name})
+                walk(fid, top, name)
+            for f in selected_files:
+                task = {"box_file_id": f["id"], "name": f["name"],
+                        "path": f["name"], "size": f.get("size", ""),
+                        "parent_id": dest_parent_id}
+                with clock:
+                    counters["found"] += 1
+                task_q.put(task)
+        finally:
+            # Signal every worker to stop.
+            for _ in range(workers):
+                task_q.put(DONE)
+
+    # --- consumers: pull tasks and transfer, each with its own clients ---
+    def consumer():
+        while True:
+            task = task_q.get()
+            if task is DONE:
+                task_q.task_done()
+                return
+            if ckpt.is_done(task["box_file_id"]):
+                with clock:
+                    counters["skipped"] += 1
+                task_q.task_done()
+                continue
+            success, path, err = transfer_one(
+                None, None, task, ckpt, log, limiter, drive_factory, box_factory)
+            with clock:
+                counters["done"] += 1
+                if success:
+                    counters["ok"] += 1
+                else:
+                    counters["fail"] += 1
+            emit_counts(path=path, success=success, error=err)
+            task_q.task_done()
+
+    progress({"type": "start", "total": 0, "pending": 0, "skipped": 0})
+
+    walk_thread = threading.Thread(target=walker, daemon=True)
+    walk_thread.start()
+
+    consumers = [threading.Thread(target=consumer, daemon=True)
+                 for _ in range(workers)]
+    for t in consumers:
+        t.start()
+
+    walk_thread.join()
+    for t in consumers:
+        t.join()
+
+    progress({"type": "done", "ok": counters["ok"], "fail": counters["fail"],
+              "skipped": counters["skipped"]})
+    return counters["ok"], counters["fail"]
