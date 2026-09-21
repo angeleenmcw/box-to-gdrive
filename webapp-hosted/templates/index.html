@@ -152,6 +152,26 @@
   .banner.done { background: var(--accent-soft); color: var(--accent); }
   .banner.error { background: #f6e3dd; color: var(--warn); }
 
+  /* Destination folder picker */
+  .dest-picker { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .dest-chosen {
+    padding: 8px 10px; font-size: 13px; background: var(--accent-soft);
+    color: var(--accent); font-weight: 600; border-bottom: 1px solid var(--line);
+  }
+  .dest-tree { max-height: 180px; overflow: auto; padding: 4px 0; font-size: 13px; }
+  .dest-row {
+    display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+    cursor: pointer; border-radius: 5px;
+  }
+  .dest-row:hover { background: var(--accent-soft); }
+  .dest-row.selected { background: var(--accent-soft); font-weight: 600; }
+  .dest-twist { width: 14px; text-align: center; color: var(--muted);
+    font-family: "IBM Plex Mono", monospace; flex: none; cursor: pointer; }
+  .dest-twist.leaf { visibility: hidden; }
+  .dest-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dest-children { margin-left: 16px; border-left: 1px dotted var(--line); padding-left: 3px; }
+  .dest-loading { color: var(--muted); font-style: italic; padding: 4px 8px; font-size: 12px; }
+
   .failures {
     margin-top: 14px; border: 1px solid #e4c3b8; border-radius: 8px;
     background: #fbf1ec; padding: 12px 14px; font-size: 13px;
@@ -288,9 +308,13 @@
     <select id="drive"><option>Loading Shared Drives…</option></select>
 
     <div class="row-inline">
-      <div>
-        <label class="field" for="dest">Destination folder ID <span style="color:var(--muted)">(optional)</span></label>
-        <select id="dest" disabled><option value="">Drive root</option></select>
+      <div style="flex:1">
+        <label class="field">Destination folder <span style="color:var(--muted)">(optional — defaults to Drive root)</span></label>
+        <div class="dest-picker">
+          <div class="dest-chosen" id="dest-chosen">Drive root</div>
+          <div class="dest-tree" id="dest-tree"></div>
+        </div>
+        <input type="hidden" id="dest" value="">
       </div>
       <div class="workers">
         <label class="field" for="workers">Workers</label>

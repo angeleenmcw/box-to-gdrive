@@ -127,8 +127,102 @@ async function loadDrives() {
       driveEl.appendChild(o);
     });
     updateGoState();
+    buildDestTree();                 // populate destination tree for the first drive
   } catch (e) {
     driveEl.innerHTML = `<option value="">Error: ${e.message}</option>`;
+  }
+}
+
+// ---------- Destination folder tree ----------
+const destChosenEl = document.getElementById("dest-chosen");
+const destTreeEl = document.getElementById("dest-tree");
+
+function setDestination(id, label) {
+  destEl.value = id || "";
+  destChosenEl.textContent = label;
+  // clear any prior .selected highlight
+  destTreeEl.querySelectorAll(".dest-row.selected").forEach(r => r.classList.remove("selected"));
+}
+
+async function fetchDestFolders(parent) {
+  const driveId = driveEl.value;
+  const url = "/api/drive/folders?drive_id=" + encodeURIComponent(driveId) +
+              (parent ? "&parent=" + encodeURIComponent(parent) : "");
+  const r = await fetch(url);
+  const d = await r.json();
+  if (!d.ok) throw new Error(d.error || "Failed to load folders");
+  return d.folders;
+}
+
+function makeDestNode(folder) {
+  const node = document.createElement("div");
+  const row = document.createElement("div");
+  row.className = "dest-row";
+  const twist = document.createElement("span");
+  twist.className = "dest-twist";
+  twist.textContent = "▸";
+  const name = document.createElement("span");
+  name.className = "dest-name";
+  name.textContent = folder.name;
+  row.append(twist, name);
+  node.appendChild(row);
+
+  const children = document.createElement("div");
+  children.className = "dest-children";
+  children.style.display = "none";
+  node.appendChild(children);
+
+  let loaded = false;
+  twist.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const open = children.style.display === "none";
+    children.style.display = open ? "block" : "none";
+    twist.textContent = open ? "▾" : "▸";
+    if (open && !loaded) {
+      loaded = true;
+      children.innerHTML = '<div class="dest-loading">Loading…</div>';
+      try {
+        const subs = await fetchDestFolders(folder.id);
+        children.innerHTML = "";
+        if (!subs.length) { twist.className = "dest-twist leaf"; }
+        subs.forEach(s => children.appendChild(makeDestNode(s)));
+      } catch (err) {
+        children.innerHTML = `<div class="dest-loading">Error: ${err.message}</div>`;
+      }
+    }
+  });
+  // Clicking the name selects this folder as the destination.
+  row.addEventListener("click", () => {
+    setDestination(folder.id, folder.name);
+    row.classList.add("selected");
+  });
+  return node;
+}
+
+async function buildDestTree() {
+  setDestination("", "Drive root");
+  destTreeEl.innerHTML = '<div class="dest-loading">Loading folders…</div>';
+  // A "Drive root" row at the top so it's easy to pick the default.
+  try {
+    const folders = await fetchDestFolders(null);
+    destTreeEl.innerHTML = "";
+    const rootRow = document.createElement("div");
+    rootRow.className = "dest-row selected";
+    rootRow.innerHTML = '<span class="dest-twist leaf"></span><span class="dest-name">📁 Drive root (top level)</span>';
+    rootRow.addEventListener("click", () => {
+      setDestination("", "Drive root");
+      rootRow.classList.add("selected");
+    });
+    destTreeEl.appendChild(rootRow);
+    folders.forEach(f => destTreeEl.appendChild(makeDestNode(f)));
+    if (!folders.length) {
+      const none = document.createElement("div");
+      none.className = "dest-loading";
+      none.textContent = "No sub-folders — files go to Drive root.";
+      destTreeEl.appendChild(none);
+    }
+  } catch (e) {
+    destTreeEl.innerHTML = `<div class="dest-loading">Could not load folders: ${e.message}</div>`;
   }
 }
 
@@ -153,7 +247,7 @@ function updateGoState() {
   goEl.disabled = !(hasSel && hasDrive);
 }
 
-driveEl.addEventListener("change", updateGoState);
+driveEl.addEventListener("change", () => { updateGoState(); buildDestTree(); });
 
 // ---------- Migration (background job + polling) ----------
 let totalPending = 0;

@@ -258,6 +258,34 @@ def list_shared_drives(drive):
     return out
 
 
+def list_drive_folders(drive, shared_drive_id, parent_id):
+    """Return the sub-folders directly under parent_id within a Shared Drive,
+    so the UI can browse the destination tree. parent_id may be the Shared
+    Drive id itself (its root) or any folder id inside it."""
+    out = []
+    page_token = None
+    query = (f"'{parent_id}' in parents and "
+             f"mimeType = '{GOOGLE_FOLDER_MIME}' and trashed = false")
+    while True:
+        resp = drive.files().list(
+            q=query,
+            corpora="drive",
+            driveId=shared_drive_id,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageSize=200,
+            pageToken=page_token,
+            orderBy="name",
+            fields="nextPageToken, files(id, name)",
+        ).execute()
+        for f in resp.get("files", []):
+            out.append({"id": f["id"], "name": f["name"]})
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Google Drive write helpers
 # --------------------------------------------------------------------------- #

@@ -250,6 +250,24 @@ def api_shared_drives():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/drive/folders")
+def api_drive_folders():
+    """List destination sub-folders under a parent within a Shared Drive.
+    Params: drive_id (the Shared Drive), parent (folder id; defaults to the
+    drive root = drive_id)."""
+    drive_id = request.args.get("drive_id")
+    if not drive_id:
+        return jsonify({"ok": False, "error": "drive_id required"}), 400
+    parent = request.args.get("parent") or drive_id
+    try:
+        creds = drive_creds_for_session()
+        drive = migrator.gdrive_service_from_creds(creds)
+        folders = migrator.list_drive_folders(drive, drive_id, parent)
+        return jsonify({"ok": True, "folders": folders})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # --------------------------------------------------------------------------- #
 # Migration (SSE) — builds per-thread clients from the session's tokens
 # --------------------------------------------------------------------------- #
