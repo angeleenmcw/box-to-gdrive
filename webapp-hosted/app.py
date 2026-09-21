@@ -457,7 +457,9 @@ def api_migrate():
         "dest_folder_id": payload.get("dest_folder_id"),
         "folders": payload.get("folders", []),
         "files": payload.get("files", []),
-        "workers": int(payload.get("workers", 4)),
+        # Cap workers at 2: fewer files held in memory at once means the
+        # instance is far less likely to be recycled mid-transfer.
+        "workers": min(int(payload.get("workers", 2)), 2),
         "rate": float(payload.get("rate", 10)),
     }
 

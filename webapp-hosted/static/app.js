@@ -254,6 +254,7 @@ let totalPending = 0;
 let lastRenderedCursor = 0;
 let pollTimer = null;
 let currentJobId = null;
+let autoResuming = false;   // guard so we don't launch overlapping resumes
 
 goEl.addEventListener("click", async () => {
   goEl.disabled = true;
@@ -360,13 +361,52 @@ function renderProgress(j) {
     showBanner("error", "Migration stopped: " + (j.error || "unknown error"));
     goEl.disabled = false;
   } else if (j.status === "interrupted") {
-    showBanner("error", (j.error || "The migration was interrupted.") +
-      (typeof j.done === "number" ? `  (${j.done} file(s) copied before interruption.)` : ""));
-    goEl.disabled = false;
+    // Auto-resume: the server restarted, so kick off a resume by ourselves
+    // and keep going until the migration is truly complete. The checkpoint
+    // means already-copied files are skipped, so this makes forward progress
+    // each cycle without any clicking.
+    if (!autoResuming) {
+      showBanner("done",
+        `Server restarted after ${typeof j.done === "number" ? j.done : "some"} file(s). ` +
+        `Auto-resuming…`);
+      autoResume();
+    }
   } else if (j.status === "needs_reconnect") {
     showReconnect(j);
     goEl.disabled = false;
   }
+}
+
+// Automatically resume an interrupted job, retrying with a short back-off if
+// the server is still coming back up. Continues until the job reports done,
+// a real error, or a token expiry (which needs a manual reconnect).
+async function autoResume() {
+  autoResuming = true;
+  let attempt = 0;
+  const tryResume = async () => {
+    attempt++;
+    try {
+      const r = await fetch("/api/resume/" + currentJobId, { method: "POST" });
+      // If the server is mid-restart, the request may fail — retry shortly.
+      if (!r.ok) { setTimeout(tryResume, 4000); return; }
+      const d = await r.json();
+      if (!d.ok) {
+        // Couldn't resume (e.g. job details lost). Surface it rather than loop.
+        autoResuming = false;
+        showBanner("error", d.error || "Could not auto-resume — click Migrate to continue.");
+        goEl.disabled = false;
+        return;
+      }
+      autoResuming = false;   // resumed successfully; a later restart may set it again
+      addLine("scan", "scan", `Auto-resuming (attempt ${attempt})… already-copied files skipped.`);
+      pollProgress(currentJobId);
+    } catch (e) {
+      // Network blip while the instance restarts — wait and retry.
+      setTimeout(tryResume, 4000);
+    }
+  };
+  // Give the instance a moment to finish restarting before the first retry.
+  setTimeout(tryResume, 3000);
 }
 
 // When the Box session expires mid-run, offer reconnect + resume without
