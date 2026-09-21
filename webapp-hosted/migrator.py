@@ -207,25 +207,31 @@ def _folder_item_count(box, folder_id):
         return None  # count is best-effort; never break the listing
 
 
-def list_box_folder(box, folder_id):
-    """Return immediate children of a Box folder as a list of dicts.
-
-    For folders we include `size` (total bytes of everything nested, per Box)
-    and `item_count` (number of direct children). The count requires a separate
-    per-folder Box call, so we run those in parallel to limit the slowdown.
-    """
+def _iter_box_folder_basic(box, folder_id):
+    """Yield immediate children of a Box folder — id, name, type, size only.
+    A generator, so memory stays flat while walking huge folders."""
     items = box.folder(folder_id).get_items(
         limit=1000,
         fields=["id", "name", "type", "size"],
     )
-    out = []
     for item in items:
-        out.append({
-            "id": item.id,
-            "name": item.name,
-            "type": item.type,  # 'folder' or 'file'
-            "size": getattr(item, "size", None),
-        })
+        yield {"id": item.id, "name": item.name, "type": item.type,
+               "size": getattr(item, "size", None)}
+
+
+def list_box_folder_basic(box, folder_id):
+    """List (not generate) a folder's children — id, name, type, size only.
+    No per-folder count calls, so it's cheap for the migration scan."""
+    out = list(_iter_box_folder_basic(box, folder_id))
+    out.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
+    return out
+
+
+def list_box_folder(box, folder_id):
+    """Browsing view: children plus an accurate `item_count` per sub-folder
+    (an extra per-folder Box call, run in parallel). Used by the tree UI, NOT
+    by the migration scan."""
+    out = list_box_folder_basic(box, folder_id)
 
     # Fetch accurate child-counts for the subfolders, in parallel.
     folder_ids = [e["id"] for e in out if e["type"] == "folder"]
@@ -240,7 +246,6 @@ def list_box_folder(box, folder_id):
             if e["type"] == "folder":
                 e["item_count"] = counts.get(e["id"])
 
-    out.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
     return out
 
 
@@ -470,7 +475,7 @@ def expand_selection(box, selected_folders, selected_files, dest_parent_id,
     tasks = []
 
     def walk(box_folder_id, gdrive_parent_id, rel_path):
-        for item in list_box_folder(box, box_folder_id):
+        for item in _iter_box_folder_basic(box, box_folder_id):
             item_path = f"{rel_path}/{item['name']}" if rel_path else item["name"]
             if item["type"] == "folder":
                 cached = ckpt.get_folder(item["id"])
