@@ -193,33 +193,53 @@ class RateLimiter:
 # --------------------------------------------------------------------------- #
 # Browsing (for the UI)
 # --------------------------------------------------------------------------- #
+def _folder_item_count(box, folder_id):
+    """Fetch a single folder's direct-child count. Box only returns
+    item_collection.total_count when a folder is fetched by its own id, not in
+    a bulk listing — hence this per-folder call."""
+    try:
+        f = box.folder(folder_id).get(fields=["item_collection"])
+        ic = getattr(f, "item_collection", None)
+        if isinstance(ic, dict):
+            return ic.get("total_count")
+        return getattr(ic, "total_count", None)
+    except Exception:  # noqa: BLE001
+        return None  # count is best-effort; never break the listing
+
+
 def list_box_folder(box, folder_id):
     """Return immediate children of a Box folder as a list of dicts.
 
     For folders we include `size` (total bytes of everything nested, per Box)
-    and `item_count` (number of direct children) so the UI can show
-    "N items · size" on each folder row.
+    and `item_count` (number of direct children). The count requires a separate
+    per-folder Box call, so we run those in parallel to limit the slowdown.
     """
     items = box.folder(folder_id).get_items(
         limit=1000,
-        fields=["id", "name", "type", "size", "item_collection"],
+        fields=["id", "name", "type", "size"],
     )
     out = []
     for item in items:
-        entry = {
+        out.append({
             "id": item.id,
             "name": item.name,
             "type": item.type,  # 'folder' or 'file'
             "size": getattr(item, "size", None),
-        }
-        if item.type == "folder":
-            ic = getattr(item, "item_collection", None)
-            # item_collection.total_count = number of direct children
-            if isinstance(ic, dict):
-                entry["item_count"] = ic.get("total_count")
-            else:
-                entry["item_count"] = getattr(ic, "total_count", None)
-        out.append(entry)
+        })
+
+    # Fetch accurate child-counts for the subfolders, in parallel.
+    folder_ids = [e["id"] for e in out if e["type"] == "folder"]
+    if folder_ids:
+        counts = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(folder_ids))) as pool:
+            future_to_id = {pool.submit(_folder_item_count, box, fid): fid
+                            for fid in folder_ids}
+            for fut in as_completed(future_to_id):
+                counts[future_to_id[fut]] = fut.result()
+        for e in out:
+            if e["type"] == "folder":
+                e["item_count"] = counts.get(e["id"])
+
     out.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
     return out
 
