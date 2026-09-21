@@ -42,7 +42,16 @@ function makeNode(item) {
 
   const kind = document.createElement("span");
   kind.className = "kind";
-  kind.textContent = item.type === "folder" ? "folder" : humanSize(item.size);
+  if (item.type === "folder") {
+    const parts = [];
+    if (typeof item.item_count === "number") {
+      parts.push(item.item_count + (item.item_count === 1 ? " item" : " items"));
+    }
+    if (item.size != null && item.size > 0) parts.push(humanSize(item.size));
+    kind.textContent = parts.length ? parts.join(" · ") : "folder";
+  } else {
+    kind.textContent = humanSize(item.size);
+  }
 
   row.append(twist, cb, name, kind);
   node.appendChild(row);
@@ -150,6 +159,7 @@ driveEl.addEventListener("change", updateGoState);
 let totalPending = 0;
 let lastRenderedCursor = 0;
 let pollTimer = null;
+let currentJobId = null;
 
 goEl.addEventListener("click", async () => {
   goEl.disabled = true;
@@ -193,6 +203,7 @@ goEl.addEventListener("click", async () => {
 });
 
 function pollProgress(jobId) {
+  currentJobId = jobId;
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     let j;
@@ -204,7 +215,8 @@ function pollProgress(jobId) {
     }
     if (!j.found) return;
     renderProgress(j);
-    if (j.status === "done" || j.status === "error") {
+    if (j.status === "done" || j.status === "error" ||
+        j.status === "interrupted" || j.status === "needs_reconnect") {
       clearInterval(pollTimer);
       pollTimer = null;
     }
@@ -253,7 +265,49 @@ function renderProgress(j) {
   } else if (j.status === "error") {
     showBanner("error", "Migration stopped: " + (j.error || "unknown error"));
     goEl.disabled = false;
+  } else if (j.status === "interrupted") {
+    showBanner("error", (j.error || "The migration was interrupted.") +
+      (typeof j.done === "number" ? `  (${j.done} file(s) copied before interruption.)` : ""));
+    goEl.disabled = false;
+  } else if (j.status === "needs_reconnect") {
+    showReconnect(j);
+    goEl.disabled = false;
   }
+}
+
+// When the Box session expires mid-run, offer reconnect + resume without
+// losing progress (the checkpoint skips already-copied files).
+function showReconnect(j) {
+  bannerEl.className = "banner show error";
+  const doneNote = (typeof j.done === "number")
+    ? ` ${j.done} file(s) already copied are saved.` : "";
+  bannerEl.innerHTML =
+    (j.error || "Box session expired.") + doneNote + "<br>";
+  const reconnect = document.createElement("a");
+  reconnect.className = "btn small";
+  reconnect.style.marginTop = "8px";
+  reconnect.textContent = "Reconnect Box";
+  reconnect.href = "/oauth/box/start";
+  reconnect.target = "_blank";           // reconnect in a new tab
+  const resume = document.createElement("button");
+  resume.className = "btn small";
+  resume.style.margin = "8px 0 0 8px";
+  resume.textContent = "Resume migration";
+  resume.onclick = async () => {
+    resume.disabled = true;
+    try {
+      const r = await fetch("/api/resume/" + currentJobId, { method: "POST" });
+      const d = await r.json();
+      if (!d.ok) { showBanner("error", d.error || "Could not resume."); return; }
+      bannerEl.className = "banner";
+      addLine("scan", "scan", "Resuming — already-copied files will be skipped…");
+      pollProgress(currentJobId);
+    } catch (e) {
+      showBanner("error", "Resume failed: " + e.message);
+    }
+  };
+  bannerEl.appendChild(reconnect);
+  bannerEl.appendChild(resume);
 }
 
 function addLine(tag, tagClass, text, errText) {

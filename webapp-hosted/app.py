@@ -322,34 +322,18 @@ def _push_recent(job_id, line):
             _persist_job(job_id)
 
 
-@app.route("/api/migrate", methods=["POST"])
-def api_migrate():
-    if not _box_tokens() or not _google_tokens():
-        return jsonify({"ok": False, "error": "Connect both Box and Google first."}), 400
-
-    payload = request.get_json(force=True)
-    shared_drive_id = payload["shared_drive_id"]
-    dest_parent = payload.get("dest_folder_id") or shared_drive_id
-    folders = payload.get("folders", [])
-    files = payload.get("files", [])
-    workers = int(payload.get("workers", 4))
-    rate = float(payload.get("rate", 10))
-
-    box_tok = dict(_box_tokens())
-    google_tok = dict(_google_tokens())
-
-    sid = session.get("sid")
-    if not sid:
-        sid = secrets.token_hex(8)
-        session["sid"] = sid
+def _launch_migration(job_id, params, box_tok, google_tok, sid):
+    """Start (or resume) a migration in a background thread. Reuses the
+    checkpoint at ckpt_path, so resuming skips already-copied files."""
+    shared_drive_id = params["shared_drive_id"]
+    dest_parent = params.get("dest_folder_id") or shared_drive_id
+    folders = params.get("folders", [])
+    files = params.get("files", [])
+    workers = int(params.get("workers", 4))
+    rate = float(params.get("rate", 10))
     ckpt_path = f"/tmp/ckpt_{sid}.json"
     log_path = f"/tmp/log_{sid}.csv"
 
-    job_id = _new_job()
-
-    # Shared, mutable token holder for this run. When the Box SDK refreshes the
-    # access token, every worker's on_refresh writes the new pair here, so all
-    # workers pick up the fresh token instead of each retrying with a stale one.
     box_token_state = {
         "access_token": box_tok["access_token"],
         "refresh_token": box_tok.get("refresh_token"),
@@ -374,6 +358,10 @@ def api_migrate():
         creds = migrator.gdrive_creds_from_token(
             google_tok, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
         return migrator.gdrive_service_from_creds(creds)
+
+    def _is_auth_error(msg):
+        return ("invalid_token" in msg or "invalid_grant" in msg
+                or "expired" in msg.lower() or "401" in msg)
 
     def progress(evt):
         t = evt.get("type")
@@ -407,19 +395,16 @@ def api_migrate():
         try:
             box = box_factory()
             drive = drive_factory()
-            # Pre-flight: verify the Box token actually works before scanning,
-            # so an expired session fails fast with a clear message instead of
-            # 401-ing on every file.
+            # Pre-flight: verify the Box token works. If it's expired, pause the
+            # job (needs_reconnect) instead of failing, so the user can click
+            # Reconnect Box and resume from the checkpoint.
             try:
                 box.user(user_id="me").get(fields=["id"])
             except Exception as e:  # noqa: BLE001
-                msg = str(e)
-                if ("invalid_token" in msg or "invalid_grant" in msg
-                        or "expired" in msg.lower() or "401" in msg):
-                    _update_job(job_id, status="error",
-                                error="Box session expired. Please disconnect and "
-                                      "reconnect Box (top of the page), then run the "
-                                      "migration again.")
+                if _is_auth_error(str(e)):
+                    _update_job(job_id, status="needs_reconnect",
+                                error="Box session expired. Click Reconnect Box, "
+                                      "then Resume — already-copied files are skipped.")
                     return
                 raise
             ckpt = migrator.Checkpoint(ckpt_path)
@@ -435,11 +420,78 @@ def api_migrate():
                 box_factory=box_factory)
             log.close()
         except Exception as e:  # noqa: BLE001
-            _update_job(job_id, status="error", error=str(e))
+            msg = str(e)
+            if _is_auth_error(msg):
+                _update_job(job_id, status="needs_reconnect",
+                            error="Box session expired mid-migration. Click "
+                                  "Reconnect Box, then Resume — already-copied "
+                                  "files are skipped.")
+            else:
+                _update_job(job_id, status="error", error=msg)
 
     threading.Thread(target=worker, daemon=True).start()
 
-    # Return immediately; the browser polls /api/progress from here.
+
+@app.route("/api/migrate", methods=["POST"])
+def api_migrate():
+    if not _box_tokens() or not _google_tokens():
+        return jsonify({"ok": False, "error": "Connect both Box and Google first."}), 400
+
+    payload = request.get_json(force=True)
+    params = {
+        "shared_drive_id": payload["shared_drive_id"],
+        "dest_folder_id": payload.get("dest_folder_id"),
+        "folders": payload.get("folders", []),
+        "files": payload.get("files", []),
+        "workers": int(payload.get("workers", 4)),
+        "rate": float(payload.get("rate", 10)),
+    }
+
+    box_tok = dict(_box_tokens())
+    google_tok = dict(_google_tokens())
+
+    sid = session.get("sid")
+    if not sid:
+        sid = secrets.token_hex(8)
+        session["sid"] = sid
+
+    job_id = _new_job()
+    # Store params + sid on the job so a reconnect can resume it.
+    _update_job(job_id, params=params, sid=sid)
+
+    _launch_migration(job_id, params, box_tok, google_tok, sid)
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/resume/<job_id>", methods=["POST"])
+def api_resume(job_id):
+    """Resume a paused (needs_reconnect) job using the current session's fresh
+    Box + Google tokens. The checkpoint skips everything already copied."""
+    if not _box_tokens() or not _google_tokens():
+        return jsonify({"ok": False, "error": "Connect both Box and Google first."}), 400
+
+    # Load the job (from memory or disk) to recover its params + sid.
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        params = j.get("params") if j else None
+        sid = j.get("sid") if j else None
+    if params is None:
+        try:
+            with open(_job_path(job_id)) as f:
+                disk = json.load(f)
+            params = disk.get("params")
+            sid = disk.get("sid")
+            with _jobs_lock:
+                _jobs[job_id] = disk
+        except (OSError, ValueError):
+            params = None
+    if not params or not sid:
+        return jsonify({"ok": False, "error": "Cannot resume — original job details missing."}), 400
+
+    box_tok = dict(_box_tokens())
+    google_tok = dict(_google_tokens())
+    _update_job(job_id, status="starting", error=None)
+    _launch_migration(job_id, params, box_tok, google_tok, sid)
     return jsonify({"ok": True, "job_id": job_id})
 
 

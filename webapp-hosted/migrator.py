@@ -194,16 +194,32 @@ class RateLimiter:
 # Browsing (for the UI)
 # --------------------------------------------------------------------------- #
 def list_box_folder(box, folder_id):
-    """Return immediate children of a Box folder as a list of dicts."""
-    items = box.folder(folder_id).get_items(limit=1000, fields=["id", "name", "type", "size"])
+    """Return immediate children of a Box folder as a list of dicts.
+
+    For folders we include `size` (total bytes of everything nested, per Box)
+    and `item_count` (number of direct children) so the UI can show
+    "N items · size" on each folder row.
+    """
+    items = box.folder(folder_id).get_items(
+        limit=1000,
+        fields=["id", "name", "type", "size", "item_collection"],
+    )
     out = []
     for item in items:
-        out.append({
+        entry = {
             "id": item.id,
             "name": item.name,
             "type": item.type,  # 'folder' or 'file'
             "size": getattr(item, "size", None),
-        })
+        }
+        if item.type == "folder":
+            ic = getattr(item, "item_collection", None)
+            # item_collection.total_count = number of direct children
+            if isinstance(ic, dict):
+                entry["item_count"] = ic.get("total_count")
+            else:
+                entry["item_count"] = getattr(ic, "total_count", None)
+        out.append(entry)
     out.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
     return out
 
