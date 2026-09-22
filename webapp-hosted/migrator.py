@@ -17,6 +17,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from boxsdk import Client, JWTAuth, OAuth2
+try:
+    from boxsdk.exception import BoxAPIException
+except Exception:  # noqa: BLE001
+    BoxAPIException = None  # older/newer SDK layouts; we still catch by attribute
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -26,6 +30,39 @@ from googleapiclient.errors import HttpError
 
 GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def box_call(func, *args, max_retries=8, **kwargs):
+    """Call a Box SDK operation, honoring Box's rate limits. On HTTP 429 (or
+    5xx) Box returns a Retry-After header telling us how long to wait; we wait
+    that long (with a little jitter) and retry, up to max_retries. Every Box
+    call in this module goes through here so a burst of folder listings can't
+    blow past Box's per-second limit and fail."""
+    attempt = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            status = getattr(e, "status", None) or getattr(e, "code", None)
+            # BoxAPIException exposes .status (HTTP code) and .headers.
+            is_rate = status == 429
+            is_transient = status in (429, 500, 502, 503, 504)
+            if not is_transient or attempt >= max_retries:
+                raise
+            # Prefer Box's own Retry-After if present.
+            wait = None
+            headers = getattr(e, "headers", None)
+            if headers:
+                try:
+                    wait = float(headers.get("Retry-After") or headers.get("retry-after"))
+                except (TypeError, ValueError):
+                    wait = None
+            if wait is None:
+                wait = (2 ** attempt)
+            wait = min(wait, 30) + random.uniform(0, 1)
+            time.sleep(wait)
+            attempt += 1
+
 
 _RETRYABLE_403_REASONS = {
     "rateLimitExceeded",
@@ -198,7 +235,7 @@ def _folder_item_count(box, folder_id):
     item_collection.total_count when a folder is fetched by its own id, not in
     a bulk listing — hence this per-folder call."""
     try:
-        f = box.folder(folder_id).get(fields=["item_collection"])
+        f = box_call(box.folder(folder_id).get, fields=["item_collection"])
         ic = getattr(f, "item_collection", None)
         if isinstance(ic, dict):
             return ic.get("total_count")
@@ -209,8 +246,10 @@ def _folder_item_count(box, folder_id):
 
 def _iter_box_folder_basic(box, folder_id):
     """Yield immediate children of a Box folder — id, name, type, size only.
-    A generator, so memory stays flat while walking huge folders."""
-    items = box.folder(folder_id).get_items(
+    A generator, so memory stays flat while walking huge folders. The initial
+    listing call is rate-limit-aware via box_call; the SDK then pages lazily."""
+    items = box_call(
+        box.folder(folder_id).get_items,
         limit=1000,
         fields=["id", "name", "type", "size"],
     )
@@ -237,7 +276,7 @@ def list_box_folder(box, folder_id):
     folder_ids = [e["id"] for e in out if e["type"] == "folder"]
     if folder_ids:
         counts = {}
-        with ThreadPoolExecutor(max_workers=min(8, len(folder_ids))) as pool:
+        with ThreadPoolExecutor(max_workers=min(4, len(folder_ids))) as pool:
             future_to_id = {pool.submit(_folder_item_count, box, fid): fid
                             for fid in folder_ids}
             for fut in as_completed(future_to_id):
@@ -519,7 +558,7 @@ def expand_selection(box, selected_folders, selected_files, dest_parent_id,
 
     # Recurse selected folders (each becomes a top-level folder in the destination).
     for fid in selected_folders:
-        info = box.folder(fid).get(fields=["name"])
+        info = box_call(box.folder(fid).get, fields=["name"])
         name = info.name
         cached = ckpt.get_folder(fid)
         if cached:
@@ -545,7 +584,7 @@ def _download_box_file(box_c, fid, buf):
     the common failures: an expired Box session (401), or a Box-native Google
     file that has no downloadable content (404)."""
     try:
-        box_c.file(fid).download_to(buf)
+        box_call(box_c.file(fid).download_to, buf)
         return
     except Exception as e:  # noqa: BLE001
         msg = str(e)
@@ -722,7 +761,7 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
 
         try:
             for fid in selected_folders:
-                info = scan_box.folder(fid).get(fields=["name"])
+                info = box_call(scan_box.folder(fid).get, fields=["name"])
                 name = info.name
                 progress({"type": "scan", "path": name})
                 walk(fid, [(fid, name)], name)
