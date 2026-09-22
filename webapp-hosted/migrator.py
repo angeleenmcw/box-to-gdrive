@@ -626,6 +626,22 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
     clock = threading.Lock()
     DONE = object()
 
+    # Guard against copying the same Box file twice in one run. This happens
+    # when a user selects a folder AND a file (or subfolder) inside it: the
+    # folder walk reaches the file, and the standalone selection also queues it.
+    # We enqueue each Box file id at most once per run.
+    queued_ids = set()
+    queued_lock = threading.Lock()
+
+    def claim(box_file_id):
+        """Return True if this file id hasn't been queued yet this run (and
+        mark it), False if it's a duplicate to skip."""
+        with queued_lock:
+            if box_file_id in queued_ids:
+                return False
+            queued_ids.add(box_file_id)
+            return True
+
     # Lazy destination-folder resolver, shared across workers. Maps a Box folder
     # id to its created Google Drive folder id; creates the whole ancestor chain
     # on demand, each folder at most once.
@@ -671,6 +687,8 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
                     progress({"type": "scan", "path": item_path})
                     walk(item["id"], chain + [(item["id"], item["name"])], item_path)
                 else:
+                    if not claim(item["id"]):
+                        continue          # already queued via another selection
                     task = {"box_file_id": item["id"], "name": item["name"],
                             "path": item_path, "size": item.get("size", ""),
                             "chain": chain}
@@ -685,6 +703,8 @@ def stream_migration(box_factory, drive_factory, selected_folders, selected_file
                 progress({"type": "scan", "path": name})
                 walk(fid, [(fid, name)], name)
             for f in selected_files:
+                if not claim(f["id"]):
+                    continue              # file already covered by a selected folder
                 task = {"box_file_id": f["id"], "name": f["name"],
                         "path": f["name"], "size": f.get("size", ""),
                         "chain": []}   # empty chain = straight into dest root
