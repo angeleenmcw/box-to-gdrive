@@ -419,11 +419,35 @@ class Checkpoint:
             self._flush()
 
     def _flush(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"done_files": sorted(self.done_files),
-                       "folder_map": self.folder_map}, f)
-        os.replace(tmp, self.path)
+        # Use a unique temp file per write so concurrent or restart-interrupted
+        # flushes can't clobber each other's temp file (which caused
+        # "No such file or directory: ...ckpt.json.tmp" and a lost checkpoint,
+        # making resumes re-copy everything). Also fsync so the data is really
+        # on disk before the rename.
+        import tempfile
+        directory = os.path.dirname(self.path) or "."
+        data = {"done_files": sorted(self.done_files),
+                "folder_map": self.folder_map}
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".ckpt_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            finally:
+                # If replace succeeded the tmp is gone; if it failed, clean up.
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        except OSError:
+            # Never let a checkpoint write crash the migration; a missed flush
+            # just means a few files might be re-checked on resume, which the
+            # per-run dedup and is_done guard handle safely.
+            pass
 
 
 class TransferLog:
