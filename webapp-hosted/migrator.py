@@ -334,7 +334,11 @@ def list_drive_folders(drive, shared_drive_id, parent_id):
 # Google Drive write helpers
 # --------------------------------------------------------------------------- #
 def find_or_create_folder(drive, name, parent_id, shared_drive_id, limiter=None):
-    safe_name = name.replace("'", "\\'")
+    # Google Drive query strings wrap values in single quotes, so a literal
+    # backslash-escaped apostrophe is required: O'Brien -> O\'Brien. The prior
+    # code produced an invalid escape that made the lookup miss and create a
+    # duplicate folder. Escape backslashes first, then single quotes.
+    safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
     query = (
         f"name = '{safe_name}' and mimeType = '{GOOGLE_FOLDER_MIME}' "
         f"and '{parent_id}' in parents and trashed = false"
