@@ -157,6 +157,38 @@ def box_start():
     return redirect(BOX_AUTH_URL + "?" + urllib.parse.urlencode(params))
 
 
+def _exchange_token(token_url, data, provider, max_retries=4):
+    """POST an OAuth code-for-token exchange, retrying transient provider
+    errors (HTTP 5xx or 'temporarily_unavailable'), which happen when Box's or
+    Google's auth servers are briefly overloaded. Returns (ok, payload_or_msg).
+    """
+    import time as _t
+    import random as _r
+    attempt = 0
+    while True:
+        try:
+            resp = requests.post(token_url, data=data, timeout=30)
+        except requests.RequestException as e:
+            if attempt >= max_retries:
+                return False, f"Could not reach {provider}: {e}. Please try connecting again."
+            _t.sleep(min(2 ** attempt, 8) + _r.uniform(0, 1))
+            attempt += 1
+            continue
+        if resp.status_code == 200:
+            return True, resp.json()
+        # Decide whether this is worth retrying.
+        transient = resp.status_code >= 500 or "temporarily_unavailable" in resp.text
+        if transient and attempt < max_retries:
+            _t.sleep(min(2 ** attempt, 8) + _r.uniform(0, 1))
+            attempt += 1
+            continue
+        if transient:
+            return False, (f"{provider} was temporarily unavailable and didn't "
+                           "recover after several tries. Please click Connect "
+                           "again in a moment.")
+        return False, f"{provider} token exchange failed: {resp.text}"
+
+
 @app.route("/oauth/box/callback")
 def box_callback():
     if request.args.get("state") != session.get("box_state"):
@@ -164,17 +196,16 @@ def box_callback():
     code = request.args.get("code")
     if not code:
         return "Box authorization was cancelled.", 400
-    resp = requests.post(BOX_TOKEN_URL, data={
+    ok, result = _exchange_token(BOX_TOKEN_URL, {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": BOX_CLIENT_ID,
         "client_secret": BOX_CLIENT_SECRET,
         "redirect_uri": f"{REDIRECT_BASE}/oauth/box/callback",
-    }, timeout=30)
-    if resp.status_code != 200:
-        return f"Box token exchange failed: {resp.text}", 400
-    data = resp.json()
-    _save_box_tokens(data["access_token"], data.get("refresh_token"))
+    }, "Box")
+    if not ok:
+        return result, 400
+    _save_box_tokens(result["access_token"], result.get("refresh_token"))
     return redirect(url_for("index"))
 
 
@@ -204,17 +235,16 @@ def google_callback():
     code = request.args.get("code")
     if not code:
         return "Google authorization was cancelled.", 400
-    resp = requests.post(GOOGLE_TOKEN_URL, data={
+    ok, result = _exchange_token(GOOGLE_TOKEN_URL, {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
         "redirect_uri": f"{REDIRECT_BASE}/oauth/google/callback",
-    }, timeout=30)
-    if resp.status_code != 200:
-        return f"Google token exchange failed: {resp.text}", 400
-    data = resp.json()
-    _save_google_tokens(data["access_token"], data.get("refresh_token"))
+    }, "Google")
+    if not ok:
+        return result, 400
+    _save_google_tokens(result["access_token"], result.get("refresh_token"))
     return redirect(url_for("index"))
 
 
