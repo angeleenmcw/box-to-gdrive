@@ -170,7 +170,7 @@ def _is_retryable(error):
     return False
 
 
-def with_backoff(func, *args, max_retries=7, base=1.0, limiter=None, **kwargs):
+def with_backoff(func, *args, max_retries=10, base=1.0, limiter=None, **kwargs):
     attempt = 0
     while True:
         if limiter is not None:
@@ -180,7 +180,17 @@ def with_backoff(func, *args, max_retries=7, base=1.0, limiter=None, **kwargs):
         except HttpError as e:
             if not _is_retryable(e) or attempt >= max_retries:
                 raise
-            time.sleep(base * (2 ** attempt) + random.uniform(0, 1))
+            wait = None
+            try:
+                hdrs = getattr(e.resp, "headers", None) or {}
+                ra = hdrs.get("retry-after") or hdrs.get("Retry-After")
+                if ra:
+                    wait = float(ra)
+            except (TypeError, ValueError):
+                wait = None
+            if wait is None:
+                wait = min(base * (2 ** attempt), 32)
+            time.sleep(wait + random.uniform(0, 1))
             attempt += 1
 
 
@@ -412,6 +422,7 @@ def upload_stream(drive, stream, name, parent_id, limiter=None, convert=True):
     )
     response = None
     attempt = 0
+    max_upload_retries = 12          # ride out sustained rate-limit periods
     while response is None:
         if limiter is not None:
             limiter.acquire()
@@ -419,9 +430,21 @@ def upload_stream(drive, stream, name, parent_id, limiter=None, convert=True):
             _, response = request.next_chunk()
             attempt = 0
         except HttpError as e:
-            if not _is_retryable(e) or attempt >= 7:
+            if not _is_retryable(e) or attempt >= max_upload_retries:
                 raise
-            time.sleep(2 ** attempt + random.uniform(0, 1))
+            # Honor Google's Retry-After if present, else exponential backoff
+            # capped at 32s (rate-limit windows can last many seconds).
+            wait = None
+            try:
+                hdrs = getattr(e.resp, "headers", None) or {}
+                ra = hdrs.get("retry-after") or hdrs.get("Retry-After")
+                if ra:
+                    wait = float(ra)
+            except (TypeError, ValueError):
+                wait = None
+            if wait is None:
+                wait = min(2 ** attempt, 32)
+            time.sleep(wait + random.uniform(0, 1))
             attempt += 1
     return response["id"], bool(conv)
 

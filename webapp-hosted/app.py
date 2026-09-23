@@ -490,7 +490,10 @@ def api_migrate():
         # Cap workers at 2: fewer files held in memory at once means the
         # instance is far less likely to be recycled mid-transfer.
         "workers": min(int(payload.get("workers", 2)), 2),
-        "rate": float(payload.get("rate", 10)),
+        # Cap the combined Drive request rate. Google's per-user write limit is
+        # generous but bursts of small-file uploads trip "userRateLimitExceeded"
+        # easily, so default low and never allow more than 8/sec from the UI.
+        "rate": min(float(payload.get("rate", 5)), 8),
     }
 
     box_tok = dict(_box_tokens())
