@@ -262,6 +262,7 @@
   <span class="chip" id="chip-box"><span class="dot"></span>Box<span class="detail">checking…</span></span>
   <span class="chip" id="chip-google"><span class="dot"></span>Google Drive<span class="detail">checking…</span></span>
   <span class="spacer"></span>
+  <button class="link-btn" id="toggle-compare">Verify migration</button>
   <button class="link-btn" id="toggle-creds">Manage connections</button>
 </div>
 
@@ -290,6 +291,21 @@
     <b>Server not fully configured.</b> The operator must set the Box and Google
     app credentials as environment variables before connections will work.
   </div>
+</div>
+
+<div class="drawer" id="compare-drawer">
+  <h3>Verify a migration (compare Box vs Google Drive)</h3>
+  <p>Check that a Box folder was fully copied to Google Drive. On the left, tick
+     the <b>one Box folder</b> to check; on the right, pick the matching Google
+     Drive destination folder (same as for a migration). Converted files
+     (PowerPoint → Google Slides) are matched correctly, not flagged as missing.</p>
+  <label style="font-size:13px;display:inline-flex;align-items:center;gap:6px;margin-bottom:10px;">
+    <input type="checkbox" id="compare-recursive"> Include all subfolders (recursive)
+  </label>
+  <div>
+    <button class="btn small" id="run-compare">Compare selected folder</button>
+  </div>
+  <div id="compare-result" style="margin-top:14px;font-size:13px;"></div>
 </div>
 
 <main>

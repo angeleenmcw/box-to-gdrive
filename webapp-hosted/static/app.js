@@ -538,5 +538,65 @@ async function disconnectProvider(name) {
 document.getElementById("dc-box").addEventListener("click", () => disconnectProvider("box"));
 document.getElementById("dc-google").addEventListener("click", () => disconnectProvider("google"));
 
+// ---------- Verify migration (compare Box vs Drive) ----------
+const compareDrawer = document.getElementById("compare-drawer");
+document.getElementById("toggle-compare").addEventListener("click", () =>
+  compareDrawer.classList.toggle("open"));
+
+document.getElementById("run-compare").addEventListener("click", async () => {
+  const out = document.getElementById("compare-result");
+  // Exactly one Box folder must be ticked.
+  if (selectedFolders.size !== 1) {
+    out.innerHTML = '<span style="color:var(--warn)">Tick exactly one Box folder on the left to compare.</span>';
+    return;
+  }
+  if (!driveEl.value) {
+    out.innerHTML = '<span style="color:var(--warn)">Pick a Shared Drive first.</span>';
+    return;
+  }
+  const boxFolderId = [...selectedFolders][0];
+  const recursive = document.getElementById("compare-recursive").checked;
+  out.innerHTML = "Comparing… (this can take a moment for large folders)";
+  try {
+    const r = await fetch("/api/compare", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        box_folder_id: boxFolderId,
+        drive_id: driveEl.value,
+        drive_folder_id: destEl.value || driveEl.value,
+        recursive,
+      }),
+    });
+    const data = await r.json();
+    if (!data.ok) { out.innerHTML = `<span style="color:var(--warn)">${escapeHtml(data.error||"Compare failed")}</span>`; return; }
+    renderCompare(out, data);
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--warn)">Compare failed: ${escapeHtml(e.message)}</span>`;
+  }
+});
+
+function renderCompare(out, data) {
+  const s = data.summary, d = data.detail;
+  const ok = s.missing_in_drive === 0 && s.missing_folders === 0;
+  let html = `<div style="font-weight:600;color:${ok?'var(--accent)':'var(--warn)'};margin-bottom:8px;">`
+    + (ok ? "✓ All Box files found in Google Drive" : "⚠ Some items are missing in Google Drive")
+    + `</div>`;
+  html += `<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;margin-bottom:10px;">`
+    + `${s.matched} matched · ${s.missing_in_drive} missing in Drive · `
+    + `${s.missing_folders} missing folders · ${s.extra_in_drive} extra in Drive</div>`;
+  const section = (title, items, color) => {
+    if (!items.length) return "";
+    let h = `<div style="margin-top:8px;font-weight:600;color:${color}">${title} (${items.length})</div>`;
+    h += '<div style="max-height:160px;overflow:auto;font-family:\'IBM Plex Mono\',monospace;font-size:11px;border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin-top:4px;">';
+    h += items.map(i => escapeHtml(i.path)).join("<br>");
+    h += "</div>";
+    return h;
+  };
+  html += section("Missing in Google Drive", d.missing_in_drive, "var(--warn)");
+  html += section("Missing folders", d.missing_folders, "var(--warn)");
+  html += section("Extra in Google Drive (not in Box)", d.extra_in_drive, "var(--muted)");
+  out.innerHTML = html;
+}
+
 // ---------- boot ----------
 loadStatus();

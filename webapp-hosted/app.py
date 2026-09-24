@@ -280,6 +280,38 @@ def api_shared_drives():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/compare", methods=["POST"])
+def api_compare():
+    """Compare a Box folder against a Google Drive folder by file name/format,
+    accounting for pptx/gslide -> Google Slides conversion.
+    Body: { box_folder_id, drive_id (shared drive), drive_folder_id, recursive }
+    """
+    if not _box_tokens() or not _google_tokens():
+        return jsonify({"ok": False, "error": "Connect both Box and Google first."}), 400
+    payload = request.get_json(force=True)
+    box_folder_id = payload.get("box_folder_id")
+    drive_id = payload.get("drive_id")
+    drive_folder_id = payload.get("drive_folder_id") or drive_id
+    recursive = bool(payload.get("recursive", False))
+    if not box_folder_id or not drive_id:
+        return jsonify({"ok": False, "error": "box_folder_id and drive_id required"}), 400
+    try:
+        box = box_client_for_session()
+        drive = migrator.gdrive_service_from_creds(drive_creds_for_session())
+        result = migrator.compare_folder(
+            box, drive, box_folder_id, drive_id, drive_folder_id,
+            recursive=recursive)
+        summary = {
+            "matched": len(result["matched"]),
+            "missing_in_drive": len(result["missing_in_drive"]),
+            "extra_in_drive": len(result["extra_in_drive"]),
+            "missing_folders": len(result["missing_folders"]),
+        }
+        return jsonify({"ok": True, "summary": summary, "detail": result})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/drive/folders")
 def api_drive_folders():
     """List destination sub-folders under a parent within a Shared Drive.

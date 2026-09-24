@@ -312,7 +312,113 @@ def list_shared_drives(drive):
     return out
 
 
-def list_drive_folders(drive, shared_drive_id, parent_id):
+def list_drive_children(drive, shared_drive_id, parent_id):
+    """List ALL children (files and folders) directly under parent_id in a
+    Shared Drive, with their mimeType, so we can compare against Box."""
+    out = []
+    page_token = None
+    query = f"'{parent_id}' in parents and trashed = false"
+    while True:
+        resp = drive.files().list(
+            q=query, corpora="drive", driveId=shared_drive_id,
+            includeItemsFromAllDrives=True, supportsAllDrives=True,
+            pageSize=1000, pageToken=page_token, orderBy="name",
+            fields="nextPageToken, files(id, name, mimeType)",
+        ).execute()
+        for f in resp.get("files", []):
+            is_folder = f.get("mimeType") == GOOGLE_FOLDER_MIME
+            out.append({"id": f["id"], "name": f["name"],
+                        "type": "folder" if is_folder else "file",
+                        "mimeType": f.get("mimeType")})
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def _normalize_box_name(name):
+    """The key used to match a Box file against its Drive copy. Converted files
+    (pptx/gslide -> Google Slides) land in Drive with the extension stripped,
+    so for those we compare the base name; otherwise the full name. Lowercased
+    so case differences don't cause false mismatches."""
+    if _conversion_for(name):
+        base = name.rsplit(".", 1)[0]
+        return base.strip().lower()
+    return name.strip().lower()
+
+
+def _normalize_drive_name(name, mime):
+    """Match key for a Drive item. A native Google Slides file has no extension,
+    so its name is already the base; other files keep their full name."""
+    return name.strip().lower()
+
+
+def compare_folder(box, drive, box_folder_id, shared_drive_id, drive_folder_id,
+                   recursive=False, _path=""):
+    """Compare a Box folder against a Google Drive folder by (normalized) name,
+    accounting for pptx/gslide -> Google Slides conversion.
+
+    Returns a dict:
+      { "matched": [...], "missing_in_drive": [...], "extra_in_drive": [...],
+        "folder_matches": [...], "missing_folders": [...] }
+    Each entry is {"path": ..., "name": ...}. With recursive=True, descends into
+    subfolders that exist on both sides.
+    """
+    result = {"matched": [], "missing_in_drive": [], "extra_in_drive": [],
+              "missing_folders": []}
+
+    box_items = list(_iter_box_folder_basic(box, box_folder_id))
+    drive_items = list_drive_children(drive, shared_drive_id, drive_folder_id)
+
+    # Split into files and folders on each side.
+    box_files = {}
+    box_folders = {}
+    for it in box_items:
+        if it["type"] == "folder":
+            box_folders[it["name"].strip().lower()] = it
+        else:
+            box_files.setdefault(_normalize_box_name(it["name"]), it)
+
+    drive_files = {}
+    drive_folders = {}
+    for it in drive_items:
+        if it["type"] == "folder":
+            drive_folders[it["name"].strip().lower()] = it
+        else:
+            drive_files.setdefault(_normalize_drive_name(it["name"], it["mimeType"]), it)
+
+    # Files: compare by normalized key.
+    for key, it in box_files.items():
+        p = f"{_path}/{it['name']}" if _path else it["name"]
+        if key in drive_files:
+            result["matched"].append({"path": p, "name": it["name"]})
+        else:
+            result["missing_in_drive"].append({"path": p, "name": it["name"]})
+    box_file_keys = set(box_files.keys())
+    for key, it in drive_files.items():
+        if key not in box_file_keys:
+            p = f"{_path}/{it['name']}" if _path else it["name"]
+            result["extra_in_drive"].append({"path": p, "name": it["name"]})
+
+    # Folders: note any Box subfolder with no Drive counterpart.
+    for key, it in box_folders.items():
+        if key not in drive_folders:
+            p = f"{_path}/{it['name']}" if _path else it["name"]
+            result["missing_folders"].append({"path": p, "name": it["name"]})
+
+    # Recurse into subfolders present on both sides.
+    if recursive:
+        for key, b_it in box_folders.items():
+            d_it = drive_folders.get(key)
+            if not d_it:
+                continue
+            sub_path = f"{_path}/{b_it['name']}" if _path else b_it["name"]
+            sub = compare_folder(box, drive, b_it["id"], shared_drive_id,
+                                 d_it["id"], recursive=True, _path=sub_path)
+            for k in result:
+                result[k].extend(sub[k])
+
+    return result
     """Return the sub-folders directly under parent_id within a Shared Drive,
     so the UI can browse the destination tree. parent_id may be the Shared
     Drive id itself (its root) or any folder id inside it."""
