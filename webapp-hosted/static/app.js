@@ -598,5 +598,18 @@ function renderCompare(out, data) {
   out.innerHTML = html;
 }
 
+document.getElementById("export-manifest").addEventListener("click", () => {
+  const out = document.getElementById("compare-result");
+  if (selectedFolders.size !== 1) {
+    out.innerHTML = '<span style="color:var(--warn)">Tick exactly one Box folder on the left to export its file list.</span>';
+    return;
+  }
+  const boxFolderId = [...selectedFolders][0];
+  out.innerHTML = "Building manifest… (large folders take a moment; the download will start automatically)";
+  // Navigate to the download endpoint; browser handles the file save.
+  window.location.href = "/api/box/manifest?id=" + encodeURIComponent(boxFolderId);
+  setTimeout(() => { out.innerHTML = "If the download didn't start, the folder may be very large — give it a moment and try again."; }, 8000);
+});
+
 // ---------- boot ----------
 loadStatus();

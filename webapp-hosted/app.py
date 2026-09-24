@@ -312,6 +312,36 @@ def api_compare():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/box/manifest")
+def api_box_manifest():
+    """Download a JSON manifest of everything under a Box folder — a flat list
+    (path, name, type, size, box_id for every item) plus a nested tree.
+    Param: id (Box folder id)."""
+    folder_id = request.args.get("id")
+    if not folder_id:
+        return jsonify({"ok": False, "error": "id required"}), 400
+    try:
+        box = box_client_for_session()
+        m = migrator.build_box_manifest(box, folder_id)
+        payload = {
+            "box_folder_id": folder_id,
+            "root": m["tree"]["name"],
+            "total_files": m["tree"]["total_files"],
+            "total_bytes": m["tree"]["total_bytes"],
+            "items": m["_flat"],      # flat list of every file/folder
+            "tree": m["tree"],        # nested structure
+        }
+        body = json.dumps(payload, indent=2)
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                       for ch in m["tree"]["name"])[:60] or "box_folder"
+        return Response(
+            body, mimetype="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="box_manifest_{safe}.json"'})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/drive/folders")
 def api_drive_folders():
     """List destination sub-folders under a parent within a Shared Drive.

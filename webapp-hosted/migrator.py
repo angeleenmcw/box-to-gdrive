@@ -254,6 +254,50 @@ def _folder_item_count(box, folder_id):
         return None  # count is best-effort; never break the listing
 
 
+def build_box_manifest(box, folder_id, folder_name=None, _path=""):
+    """Walk a Box folder recursively and return a manifest with both a flat
+    list of every item (path, name, type, size, box_id) and a nested tree.
+    Rate-limit-aware via box_call, so it survives large folders."""
+    # Resolve this folder's own name if not given (for the root of the export).
+    if folder_name is None:
+        try:
+            info = box_call(box.folder(folder_id).get, fields=["name"])
+            folder_name = info.name
+        except Exception:  # noqa: BLE001
+            folder_name = folder_id
+
+    root_path = f"{_path}/{folder_name}" if _path else folder_name
+    flat = []
+    children_tree = []
+    total_files = 0
+    total_bytes = 0
+
+    for item in _iter_box_folder_basic(box, folder_id):
+        item_path = f"{root_path}/{item['name']}"
+        if item["type"] == "folder":
+            sub = build_box_manifest(box, item["id"], item["name"], root_path)
+            flat.append({"path": item_path, "name": item["name"],
+                         "type": "folder", "size": None, "box_id": item["id"]})
+            flat.extend(sub["_flat"])
+            children_tree.append(sub["tree"])
+            total_files += sub["tree"]["total_files"]
+            total_bytes += sub["tree"]["total_bytes"]
+        else:
+            size = item.get("size") or 0
+            flat.append({"path": item_path, "name": item["name"],
+                         "type": "file", "size": size, "box_id": item["id"]})
+            children_tree.append({"path": item_path, "name": item["name"],
+                                  "type": "file", "size": size,
+                                  "box_id": item["id"]})
+            total_files += 1
+            total_bytes += size
+
+    tree = {"path": root_path, "name": folder_name, "type": "folder",
+            "box_id": folder_id, "total_files": total_files,
+            "total_bytes": total_bytes, "children": children_tree}
+    return {"tree": tree, "_flat": flat}
+
+
 def _iter_box_folder_basic(box, folder_id):
     """Yield immediate children of a Box folder — id, name, type, size only.
     A generator, so memory stays flat while walking huge folders. The initial
